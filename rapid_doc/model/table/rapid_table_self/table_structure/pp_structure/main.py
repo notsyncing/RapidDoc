@@ -23,7 +23,9 @@ from .pre_process import TablePreprocess
 
 class PPTableStructurer:
     def __init__(self, cfg: Dict[str, Any]):
-        if cfg["engine_type"] is None:
+        if isinstance(cfg["engine_type"], str):
+            cfg["engine_type"] = EngineType(cfg["engine_type"])
+        elif cfg["engine_type"] is None:
             cfg["engine_type"] = EngineType.ONNXRUNTIME
 
         self.session = get_engine(cfg["engine_type"])(cfg)

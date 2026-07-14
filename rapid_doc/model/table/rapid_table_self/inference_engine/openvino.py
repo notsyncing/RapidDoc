@@ -39,7 +39,7 @@ class OpenVINOInferSession(InferSession):
         self.input_tensor = self.model.inputs[0]
         self.output_tensors = self.model.outputs
 
-        device = cfg.get('device', 'CPU')
+        device = cfg.get('engine_cfg', {}).get('device', 'CPU')
         ov_config = self._init_config(cfg)
         self.compiled_model = core.compile_model(
             self.model,

@@ -157,6 +157,8 @@ class TableMatch:
         dt_boxes: np.ndarray,
         rec_res: List[Tuple[str, float]],
     ) -> Tuple[np.ndarray, List[Tuple[str, float]]]:
+        if cell_bboxes.ndim != 2 or cell_bboxes.shape[0] == 0:
+            return np.empty((0, 4), dtype=np.float64), []
         y1 = cell_bboxes[:, 1::2].min()
 
         new_dt_boxes, new_rec_res = [], []

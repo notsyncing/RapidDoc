@@ -120,10 +120,11 @@ def patch_openvino_ocr():
             runtime_mod.Core = openvino.Core
             sys.modules["openvino.runtime"] = runtime_mod
 
-    # 替换 rapidocr 的 openvino
+    # 替换 rapidocr 的 openvino 模块
     from rapidocr import inference_engine
     from rapid_doc.model.ocr import openvino as self_openvino
     inference_engine.openvino = self_openvino
+    sys.modules["rapidocr.inference_engine.openvino"] = self_openvino
 
 def patch_seal_det():
     # 1、为 DBPostProcess 添加 box_type 参数

@@ -106,6 +106,8 @@ class TableLabelDecode:
         return dict_character
 
     def normalize_bboxes(self, bbox_list, ori_imgs):
+        if not bbox_list:
+            return np.empty((0, 4), dtype=np.float64)
         cell_bboxes = np.array(bbox_list)
         if self.cfg["model_type"] == ModelType.SLANETPLUS:
             cell_bboxes = self.rescale_cell_bboxes(ori_imgs, cell_bboxes)

@@ -84,10 +84,11 @@ class TableCls:
 
 class PaddleCls:
     def __init__(self, cfg):
-        if cfg["engine_type"] is None:
+        if isinstance(cfg["engine_type"], str):
+            cfg["engine_type"] = EngineType(cfg["engine_type"])
+        elif cfg["engine_type"] is None:
             cfg["engine_type"] = EngineType.ONNXRUNTIME
         self.session = get_engine(cfg["engine_type"])(cfg)
-        # self.table_cls = OpenVINOInferSession(model_path)
         self.inp_h = 224
         self.inp_w = 224
         self.resize_short = 256
@@ -136,7 +137,9 @@ class PaddleCls:
 
 class QanythingCls:
     def __init__(self, cfg):
-        if cfg["engine_type"] is None:
+        if isinstance(cfg["engine_type"], str):
+            cfg["engine_type"] = EngineType(cfg["engine_type"])
+        elif cfg["engine_type"] is None:
             cfg["engine_type"] = EngineType.ONNXRUNTIME
         self.session = get_engine(cfg["engine_type"])(cfg)
         self.inp_h = 224

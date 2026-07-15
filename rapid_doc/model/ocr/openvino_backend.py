@@ -124,6 +124,9 @@ class OpenVINOInferSession(InferSession):
     def have_key(self, key: str = "character") -> bool:
         return False
 
+    def get_character_list(self, key: str = "character") -> list:
+        return []
+
 
 class OpenVIONError(Exception):
     pass

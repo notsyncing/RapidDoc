@@ -58,6 +58,36 @@ def get_cpu_vendor():
             return vendor
     return None
 
+
+def check_openvino(target_device="CPU", require_intel_cpu=True):
+    """
+    检查当前环境是否适合作为默认 OpenVINO 推理后端。
+
+    默认只在 Intel CPU 上启用 CPU OpenVINO，避免 AMD/Apple/未知 CPU
+    因为运行时可导入而被自动切到 OpenVINO。
+    """
+    target_device = (target_device or "").upper()
+    if target_device == "CPU" and require_intel_cpu:
+        cpu_vendor = get_cpu_vendor()
+        if cpu_vendor != "intel":
+            logger.info(f"Skip OpenVINO auto selection: CPU vendor is {cpu_vendor or 'unknown'}")
+            return False
+
+    try:
+        try:
+            from openvino import Core
+        except ImportError:
+            from openvino.runtime import Core  # 兼容旧版本
+        core = Core()
+        devices = [str(device).upper() for device in core.available_devices]
+        if target_device:
+            return any(d == target_device or d.startswith(target_device + ".") for d in devices)
+        return bool(devices)
+    except Exception as e:
+        logger.warning(f"OpenVINO 可用性检查出错: {e}")
+        return False
+
+
 def crop_img(input_res, input_img: np.ndarray, crop_paste_x=0, crop_paste_y=0, layout_shape_mode="auto"):
 
     crop_xmin, crop_ymin = int(input_res['poly'][0]), int(input_res['poly'][1])
@@ -130,7 +160,7 @@ def is_inside(small_box, big_box, overlap_threshold=0.8):
     return intersection_area >= overlap_threshold * small_box[4]
 
 
-def get_res_list_from_layout_res(layout_res, np_img, overlap_threshold=0.8):
+def get_res_list_from_layout_res(layout_res, np_img, overlap_threshold=0.8, image_ocr_enable=False):
     """Extract OCR, table and other regions from layout results."""
     ocr_res_list = []
     table_res_list = []
@@ -146,7 +176,7 @@ def get_res_list_from_layout_res(layout_res, np_img, overlap_threshold=0.8):
             res['bbox'] = [int(res['poly'][0]), int(res['poly'][1]), int(res['poly'][4]), int(res['poly'][5])]
             single_page_mfdetrec_res.append(res)
         # elif category_id in [0, 2, 4, 6, 7, 3]:  # OCR regions # 相信版面结果，图片就是图片，不再尝试转为文本块
-        elif category_id in [0, 1, 2, 4, 6, 7, 9]:  # OCR regions
+        elif category_id in ([0, 1, 2, 3, 4, 6, 7] if image_ocr_enable else [0, 1, 2, 4, 6, 7, 9]):  # OCR regions
             ocr_res_list.append(res)
         elif category_id == 5:  # Table regions
             table_res_list.append(res)

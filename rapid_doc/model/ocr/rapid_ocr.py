@@ -74,6 +74,14 @@ class RapidOcrModel(object):
         if device.startswith('cpu') and check_openvino() and not engine_type:
             default_params["Det.engine_type"] = EngineType.OPENVINO
             default_params["Rec.engine_type"] = EngineType.OPENVINO
+        # OpenVINO GPU 自动路径（当 MINERU_DEVICE_MODE=openvino_gpu 时）
+        if device == 'openvino_gpu' and check_openvino(target_device="GPU") and not engine_type:
+            default_params["Det.engine_type"] = EngineType.OPENVINO
+            default_params["Rec.engine_type"] = EngineType.OPENVINO
+            default_params["Det.device"] = "GPU"
+            default_params["Rec.device"] = "GPU"
+            default_params["Cls.engine_type"] = EngineType.OPENVINO
+            default_params["Cls.device"] = "GPU"
         if engine_type == EngineType.TORCH:
             default_params["Det.engine_type"] = EngineType.TORCH
             default_params["Rec.engine_type"] = EngineType.TORCH
@@ -142,7 +150,14 @@ class RapidOcrModel(object):
             default_params['Det.use_dilation'] = False
             default_params['Det.ocr_version'] = OCRVersion.PPOCRV4
             # default_params['Rec.ocr_version'] = OCRVersion.PPOCRV4 #印章使用v4的rec模型效果更好
-            if device.startswith('cpu') and check_openvino() and not engine_type:
+            if device == 'openvino_gpu' and check_openvino(target_device="GPU") and not engine_type:
+                default_params["Det.engine_type"] = EngineType.OPENVINO
+                default_params["Rec.engine_type"] = EngineType.OPENVINO
+                default_params["Det.device"] = "GPU"
+                default_params["Rec.device"] = "GPU"
+                default_params["Cls.engine_type"] = EngineType.OPENVINO
+                default_params["Cls.device"] = "GPU"
+            elif device.startswith('cpu') and check_openvino() and not engine_type:
                 default_params["Det.engine_type"] = EngineType.OPENVINO
                 default_params["Rec.engine_type"] = EngineType.OPENVINO
             else:

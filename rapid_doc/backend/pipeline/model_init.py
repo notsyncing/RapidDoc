@@ -5,10 +5,12 @@ from loguru import logger
 from .model_list import AtomicModel
 from ...model.custom import CustomBaseModel
 from ...model.layout.rapid_layout import RapidLayoutModel
+from ...model.layout.rapid_layout_self import EngineType as LayoutEngineType
 from ...model.formula.rapid_formula_model import RapidFormulaModel
 from ...model.ocr.rapid_ocr import RapidOcrModel
 from ...model.orientation.rapid_orientation_model import RapidOrientationModel
 from ...model.table.rapid_table import RapidTableModel
+from ...model.table.rapid_table_self import EngineType as TableEngineType
 from ...utils.hash_utils import make_hashable
 
 def table_model_init(lang=None, ocr_config=None, table_config=None):
@@ -141,6 +143,26 @@ class MineruPipelineModel:
         self.apply_table = self.table_config.get('enable', True)
         self.lang = kwargs.get('lang', None)
         self.device = kwargs.get('device', 'cpu')
+
+        if self.device == 'openvino_gpu':
+            if not self.layout_config:
+                self.layout_config = {}
+            if 'engine_type' not in self.layout_config:
+                self.layout_config['engine_type'] = LayoutEngineType.OPENVINO
+            if 'engine_cfg' not in self.layout_config:
+                self.layout_config['engine_cfg'] = {}
+            if 'device' not in self.layout_config['engine_cfg']:
+                self.layout_config['engine_cfg']['device'] = 'GPU'
+
+            if not self.table_config:
+                self.table_config = {}
+            if 'engine_type' not in self.table_config:
+                self.table_config['engine_type'] = TableEngineType.OPENVINO
+            if 'engine_cfg' not in self.table_config:
+                self.table_config['engine_cfg'] = {}
+            if 'device' not in self.table_config['engine_cfg']:
+                self.table_config['engine_cfg']['device'] = 'GPU'
+
         logger.info(
             'DocAnalysis init, this may take some times......'
         )

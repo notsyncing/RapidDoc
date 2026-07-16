@@ -268,6 +268,32 @@ def batch_image_analyze(
     batch_ratio = 1
     device = get_device()
 
+    if device == 'openvino_gpu':
+        from ...model.layout.rapid_layout_self import EngineType as LayoutEngineType
+        from ...model.table.rapid_table_self import EngineType as TableEngineType
+        from rapidocr import EngineType as OCREngineType
+
+        # Inject OpenVINO GPU config before BatchAnalyze so that ALL code
+        # paths (including _process_single_table → get_atom_model) use it.
+        if layout_config is None:
+            layout_config = {}
+        layout_config.setdefault('engine_type', LayoutEngineType.OPENVINO)
+        layout_config.setdefault('engine_cfg', {}).setdefault('device', 'GPU')
+
+        if ocr_config is None:
+            ocr_config = {}
+        ocr_config.setdefault('Det.engine_type', OCREngineType.OPENVINO)
+        ocr_config.setdefault('Rec.engine_type', OCREngineType.OPENVINO)
+        ocr_config.setdefault('Cls.engine_type', OCREngineType.OPENVINO)
+        ocr_config.setdefault('Det.device', 'GPU')
+        ocr_config.setdefault('Rec.device', 'GPU')
+        ocr_config.setdefault('Cls.device', 'GPU')
+
+        if table_config is None:
+            table_config = {}
+        table_config.setdefault('engine_type', TableEngineType.OPENVINO)
+        table_config.setdefault('engine_cfg', {}).setdefault('device', 'GPU')
+
     if str(device).startswith('npu'):
         try:
             import torch_npu

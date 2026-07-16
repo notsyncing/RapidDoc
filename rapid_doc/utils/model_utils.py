@@ -81,7 +81,7 @@ def check_openvino(target_device="CPU", require_intel_cpu=True):
         core = Core()
         devices = [str(device).upper() for device in core.available_devices]
         if target_device:
-            return target_device in devices
+            return any(d == target_device or d.startswith(target_device + ".") for d in devices)
         return bool(devices)
     except Exception as e:
         logger.warning(f"OpenVINO 可用性检查出错: {e}")
@@ -159,7 +159,7 @@ def is_inside(small_box, big_box, overlap_threshold=0.8):
     return intersection_area >= overlap_threshold * small_box[4]
 
 
-def get_res_list_from_layout_res(layout_res, np_img, overlap_threshold=0.8):
+def get_res_list_from_layout_res(layout_res, np_img, overlap_threshold=0.8, image_ocr_enable=False):
     """Extract OCR, table and other regions from layout results."""
     ocr_res_list = []
     table_res_list = []
@@ -175,7 +175,7 @@ def get_res_list_from_layout_res(layout_res, np_img, overlap_threshold=0.8):
             res['bbox'] = [int(res['poly'][0]), int(res['poly'][1]), int(res['poly'][4]), int(res['poly'][5])]
             single_page_mfdetrec_res.append(res)
         # elif category_id in [0, 2, 4, 6, 7, 3]:  # OCR regions # 相信版面结果，图片就是图片，不再尝试转为文本块
-        elif category_id in [0, 1, 2, 4, 6, 7, 9]:  # OCR regions
+        elif category_id in ([0, 1, 2, 3, 4, 6, 7] if image_ocr_enable else [0, 1, 2, 4, 6, 7, 9]):  # OCR regions
             ocr_res_list.append(res)
         elif category_id == 5:  # Table regions
             table_res_list.append(res)

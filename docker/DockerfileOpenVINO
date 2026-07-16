@@ -1,0 +1,75 @@
+# === Builder: build rapid-doc wheel with all patches ===
+FROM docker.1ms.run/ubuntu:26.04 AS builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g; s|http://security.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends python3 python3-pip && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY rapid_doc/ ./rapid_doc/
+COPY pyproject.toml README.md ./
+RUN python3 -m pip install --break-system-packages build setuptools wheel && \
+    python3 -m build --wheel
+
+# === Runtime ===
+FROM docker.1ms.run/ubuntu:26.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# System dependencies + Intel GPU runtime via official PPA
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g; s|http://security.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list && \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends \
+        python3 python3-pip curl wget gnupg ca-certificates software-properties-common \
+        libglib2.0-0 libsm6 libxext6 libxrender-dev \
+        libreoffice-writer libreoffice-calc libreoffice-impress \
+        fonts-noto-core fonts-noto-cjk fontconfig libgl1 && \
+    fc-cache -fv && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN add-apt-repository -y ppa:kobuk-team/intel-graphics && \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends \
+        libze-intel-gpu1 libze1 intel-metrics-discovery intel-opencl-icd clinfo intel-gsc \
+        intel-media-va-driver-non-free libmfx-gen1.2 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+ENV PIP_INDEX_URL=https://pypi.org/simple
+ENV PIP_DEFAULT_TIMEOUT=300
+ENV PIP_RETRIES=10
+
+# Install custom OpenVINO wheel
+COPY docker/wheels/ /app/wheels/
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+        /app/wheels/openvino-2026.3.0-22438-cp314-cp314-manylinux_2_43_x86_64.whl && \
+    rm -rf /app/wheels && python3 -m pip cache purge
+
+# Install the patched rapid-doc wheel + onnxruntime
+COPY --from=builder /src/dist/rapid_doc-0.9.9-py3-none-any.whl /app/wheels/
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+        "/app/wheels/rapid_doc-0.9.9-py3-none-any.whl[api]" \
+        "onnxruntime>=1.18.0" && \
+    rm -rf /app/wheels && python3 -m pip cache purge
+
+# Copy scripts and download models
+COPY docker/.env.example /app/
+COPY docker/start_with_env.sh /app/
+RUN sed -i 's/\r$//' /app/start_with_env.sh && chmod +x /app/start_with_env.sh
+
+COPY docker/app.py docker/file_converter.py docker/download_file.py docker/download_models.py docker/models_download_utils.py /app/
+
+ENV API_PORT=8888 STARTUP_WAIT_TIME=15 LOG_LEVEL=INFO
+ENV MINERU_DEVICE_MODE=cpu RAPID_MODELS_DIR=/app/models
+RUN python3 download_models.py
+
+ENV MINERU_DEVICE_MODE=openvino_gpu
+
+EXPOSE 8888 8888
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
+    CMD curl -f http://localhost:$API_PORT/health || exit 1
+
+CMD ["./start_with_env.sh"]

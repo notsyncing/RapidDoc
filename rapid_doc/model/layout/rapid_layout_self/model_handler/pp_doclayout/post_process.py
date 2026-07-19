@@ -700,13 +700,13 @@ def calculate_polygon_overlap_ratio(
     intersection = poly1.intersection(poly2).area
     union = poly1.union(poly2).area
     if mode == "union":
-        return intersection / union
+        return intersection / union if union > 0 else 0.0
     elif mode == "small":
         small_area = min(poly1.area, poly2.area)
-        return intersection / small_area
+        return intersection / small_area if small_area > 0 else 0.0
     elif mode == "large":
         large_area = max(poly1.area, poly2.area)
-        return intersection / large_area
+        return intersection / large_area if large_area > 0 else 0.0
     else:
         raise ValueError(f"Unknown mode: {mode}")
 

@@ -95,17 +95,17 @@ class OpenVINOInferSession(InferSession):
         try:
             input_tensor_name = self.input_tensor.get_any_name()
             self.infer_request.set_tensor(input_tensor_name, ov.Tensor(input_content))
-
-            # self.infer_request.infer()
-            # 使用异步推理替代同步 infer()
             self.infer_request.start_async()
-            self.infer_request.wait()  # 等待推理完成
+            self.infer_request.wait()
 
             outputs = []
             for output_tensor in self.output_tensors:
                 output_tensor_name = output_tensor.get_any_name()
                 output = self.infer_request.get_tensor(output_tensor_name).data
                 outputs.append(output)
+
+            del self.infer_request
+            self.infer_request = self.compiled_model.create_infer_request()
 
             return outputs
 

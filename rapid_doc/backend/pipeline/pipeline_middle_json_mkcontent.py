@@ -298,6 +298,12 @@ def make_blocks_to_content_list(para_block, img_buket_path, page_idx, page_size)
             if block['type'] == BlockType.TABLE_FOOTNOTE:
                 para_content[BlockType.TABLE_FOOTNOTE].append(merge_para_with_text(block))
 
+        if (not para_content.get(BlockType.TABLE_BODY)
+                and not para_content.get(BlockType.TABLE_CAPTION)
+                and not para_content.get(BlockType.TABLE_FOOTNOTE)):
+            # 空表格没有可输出的内容，避免在 content list 中留下空表。
+            return None
+
     page_width, page_height = page_size
     para_bbox = para_block.get('bbox')
     if para_bbox:

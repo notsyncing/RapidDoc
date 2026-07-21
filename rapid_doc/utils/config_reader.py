@@ -79,21 +79,34 @@ def get_device():
     device_mode = os.getenv('MINERU_DEVICE_MODE', None)
     if device_mode is not None:
         return device_mode
-    else:
-        torch_ = import_package("torch")
-        if torch_ is None:
-            return "cpu"
-        if torch.cuda.is_available():
-            return "cuda"
-        elif torch.backends.mps.is_available():
-            return "mps"
-        else:
-            try:
-                if torch_npu.npu.is_available():
-                    return "npu"
-            except Exception as e:
-                pass
+
+    # Auto-detect OpenVINO GPU — prefer it over CUDA for Intel GPUs
+    try:
+        openvino_ = import_package("openvino")
+        if openvino_ is not None:
+            from openvino import Core
+            core = Core()
+            if 'GPU' in core.available_devices:
+                os.environ.setdefault('OMP_NUM_THREADS', '1')
+                os.environ.setdefault('OPENVINO_NUM_THREADS', '1')
+                return "openvino_gpu"
+    except Exception:
+        pass
+
+    torch_ = import_package("torch")
+    if torch_ is None:
         return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        return "mps"
+    else:
+        try:
+            if torch_npu.npu.is_available():
+                return "npu"
+        except Exception as e:
+            pass
+    return "cpu"
 
 
 def get_formula_enable(formula_enable):

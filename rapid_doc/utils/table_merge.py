@@ -1,4 +1,5 @@
 # Copyright (c) Opendatalab. All rights reserved.
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -595,6 +596,41 @@ def can_merge_by_structure(
     return check_rows_match(previous_state, current_state)
 
 
+_NUMERIC_CELL_PATTERN = re.compile(r'^[-+(]?(?:\d[\d,.]*%?|\d+\.\d+)[)]?$')
+
+
+def _is_numeric_cell_text(text: str) -> bool:
+    normalized = full_to_half(text).strip().replace(' ', '')
+    return bool(normalized) and bool(_NUMERIC_CELL_PATTERN.match(normalized))
+
+
+def _front_row_texts(state: TableMergeState) -> tuple[str, ...]:
+    if not state.front_header_info:
+        return ()
+    return tuple(text for text in state.front_header_info[0].normalized_texts if text)
+
+
+def _has_conflicting_table_headers(current_state: TableMergeState, previous_state: TableMergeState) -> bool:
+    """检测两页表格首行是否为互不相同的表头。
+
+    跨页续表要么重复同一表头，要么直接以数据行开始；若新页首行是
+    另一组表头（如上一页末尾是利润表、本页开头是资产负债表），
+    强行合并会丢掉整张表，因此应拒绝合并。
+    """
+    current_texts = _front_row_texts(current_state)
+    previous_texts = _front_row_texts(previous_state)
+    if len(current_texts) < 2 or len(previous_texts) < 2:
+        return False
+    # 首行包含数值时按数据行处理，通常是续表的正文行。
+    if any(_is_numeric_cell_text(text) for text in current_texts):
+        return False
+
+    current_set = set(current_texts)
+    previous_set = set(previous_texts)
+    overlap = len(current_set & previous_set) / max(1, len(current_set | previous_set))
+    return overlap < 0.2
+
+
 def can_merge_tables(current_state: TableMergeState, previous_state: TableMergeState):
     """判断两个表格是否可以合并."""
     current_table_block = current_state.owner_block
@@ -635,6 +671,9 @@ def can_merge_tables(current_state: TableMergeState, previous_state: TableMergeS
     table2_width = x1_t2 - x0_t2
 
     if abs(table1_width - table2_width) / min(table1_width, table2_width) >= 0.1:
+        return False
+
+    if _has_conflicting_table_headers(current_state, previous_state):
         return False
 
     if previous_state.total_cols == current_state.total_cols:
@@ -1117,3 +1156,11 @@ def merge_table(page_info_list):
     for state in state_cache.values():
         if state.dirty and id(state.owner_block) not in merged_away_blocks:
             _serialize_table_state_html(state)
+
+    if merged_away_blocks:
+        # 已并入上一页的续表不应再作为空表格输出。
+        for page_info in page_info_list:
+            para_blocks = page_info.get("para_blocks", [])
+            page_info["para_blocks"] = [
+                block for block in para_blocks if id(block) not in merged_away_blocks
+            ]

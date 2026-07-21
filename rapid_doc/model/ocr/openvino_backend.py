@@ -25,15 +25,29 @@ from rapidocr.utils.log import logger
 from rapidocr.inference_engine.base import FileInfo, InferSession
 
 
+_COMPILED_MODELS: Dict[str, Any] = {}
+_DEFAULT_OCR_MODEL_DIR = None
+
+def _get_ocr_model_dir():
+    global _DEFAULT_OCR_MODEL_DIR
+    if _DEFAULT_OCR_MODEL_DIR is None:
+        try:
+            import rapidocr
+            _DEFAULT_OCR_MODEL_DIR = Path(rapidocr.__file__).parent / "models"
+        except Exception:
+            _DEFAULT_OCR_MODEL_DIR = Path(__file__).parent.parent.parent / "resources"
+    return _DEFAULT_OCR_MODEL_DIR
+
 class OpenVINOInferSession(InferSession):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
         self.logger = logger
 
-        core = Core()
-
         model_path = cfg.get("model_path", None)
         if model_path is None:
+            model_root_dir = cfg.get("model_root_dir", None)
+            if model_root_dir is None:
+                model_root_dir = str(_get_ocr_model_dir())
             model_info = self.get_model_url(
                 FileInfo(
                     engine_type=cfg.engine_type,
@@ -43,7 +57,7 @@ class OpenVINOInferSession(InferSession):
                     model_type=cfg.model_type,
                 )
             )
-            model_path = self.DEFAULT_MODEL_PATH / Path(model_info["model_dir"]).name
+            model_path = Path(model_root_dir) / Path(model_info["model_dir"]).name
             download_params = DownloadFileInput(
                 file_url=model_info["model_dir"],
                 sha256=model_info["SHA256"],
@@ -56,26 +70,24 @@ class OpenVINOInferSession(InferSession):
         model_path = Path(model_path)
         self._verify_model(model_path)
 
-        self.model = core.read_model(model=str(model_path))
-        self.input_tensor = self.model.inputs[0]
-        self.output_tensors = self.model.outputs
-
         device = cfg.get('device', 'CPU')
         ov_config = self._init_config(cfg)
-        self.compiled_model = core.compile_model(
-            self.model,
-            device,
-            ov_config,
-        )
+
+        cache_key = f"{model_path}:{device}"
+        if cache_key in _COMPILED_MODELS:
+            self.model, self.compiled_model, self.input_tensor, self.output_tensors = _COMPILED_MODELS[cache_key]
+        else:
+            core = Core()
+            self.model = core.read_model(model=str(model_path))
+            self.input_tensor = self.model.inputs[0]
+            self.output_tensors = self.model.outputs
+            self.compiled_model = core.compile_model(self.model, device, ov_config)
+            _COMPILED_MODELS[cache_key] = (self.model, self.compiled_model, self.input_tensor, self.output_tensors)
         self.infer_request = self.compiled_model.create_infer_request()
 
     def _init_config(self, cfg: DictConfig) -> Dict[Any, Any]:
         config = {}
         engine_cfg = cfg.get("engine_cfg", {})
-
-        infer_num_threads = engine_cfg.get("inference_num_threads", -1)
-        if infer_num_threads != -1 and 1 <= infer_num_threads <= os.cpu_count():
-            config["INFERENCE_NUM_THREADS"] = str(infer_num_threads)
 
         performance_hint = engine_cfg.get("performance_hint", None)
         if performance_hint is not None:
@@ -85,21 +97,31 @@ class OpenVINOInferSession(InferSession):
         if performance_num_requests != -1:
             config["PERFORMANCE_HINT_NUM_REQUESTS"] = str(performance_num_requests)
 
-        enable_cpu_pinning = engine_cfg.get("enable_cpu_pinning", None)
-        if enable_cpu_pinning is not None:
-            config["ENABLE_CPU_PINNING"] = str(enable_cpu_pinning)
+        cache_dir = engine_cfg.get("cache_dir", None)
+        if cache_dir is not None:
+            config["CACHE_DIR"] = str(cache_dir)
 
-        num_streams = engine_cfg.get("num_streams", -1)
-        if num_streams != -1:
-            config["NUM_STREAMS"] = str(num_streams)
+        device = cfg.get('device', 'CPU')
+        if device.upper() != 'GPU':
+            infer_num_threads = engine_cfg.get("inference_num_threads", -1)
+            if infer_num_threads != -1 and 1 <= infer_num_threads <= os.cpu_count():
+                config["INFERENCE_NUM_THREADS"] = str(infer_num_threads)
 
-        enable_hyper_threading = engine_cfg.get("enable_hyper_threading", None)
-        if enable_hyper_threading is not None:
-            config["ENABLE_HYPER_THREADING"] = str(enable_hyper_threading)
+            enable_cpu_pinning = engine_cfg.get("enable_cpu_pinning", None)
+            if enable_cpu_pinning is not None:
+                config["ENABLE_CPU_PINNING"] = str(enable_cpu_pinning)
 
-        scheduling_core_type = engine_cfg.get("scheduling_core_type", None)
-        if scheduling_core_type is not None:
-            config["SCHEDULING_CORE_TYPE"] = str(scheduling_core_type)
+            num_streams = engine_cfg.get("num_streams", -1)
+            if num_streams != -1:
+                config["NUM_STREAMS"] = str(num_streams)
+
+            enable_hyper_threading = engine_cfg.get("enable_hyper_threading", None)
+            if enable_hyper_threading is not None:
+                config["ENABLE_HYPER_THREADING"] = str(enable_hyper_threading)
+
+            scheduling_core_type = engine_cfg.get("scheduling_core_type", None)
+            if scheduling_core_type is not None:
+                config["SCHEDULING_CORE_TYPE"] = str(scheduling_core_type)
 
         self.logger.info(f"Using OpenVINO config: {config}")
         return config

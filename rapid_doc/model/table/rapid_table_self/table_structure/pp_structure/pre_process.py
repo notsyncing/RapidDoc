@@ -17,7 +17,7 @@ class TablePreprocess:
 
     def __call__(
         self, img_list: List[np.ndarray]
-    ) -> Tuple[List[np.ndarray], np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         if isinstance(img_list, np.ndarray):
             img_list = [img_list]
 
@@ -34,7 +34,7 @@ class TablePreprocess:
             processed_imgs.append(img_processed)
             shape_lists.append(shape_list)
 
-        return processed_imgs, np.array(shape_lists)
+        return np.stack(processed_imgs, axis=0), np.array(shape_lists)
 
     def resize_image(self, img: np.ndarray) -> Tuple[np.ndarray, List[float]]:
         h, w = img.shape[:2]

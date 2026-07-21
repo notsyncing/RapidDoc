@@ -282,7 +282,6 @@ def batch_image_analyze(
         layout_cfg.setdefault('device', 'GPU')
         layout_cfg.setdefault('performance_hint', 'THROUGHPUT')
         layout_cfg.setdefault('performance_num_requests', 4)
-        layout_cfg.setdefault('inference_num_threads', 1)
 
         if ocr_config is None:
             ocr_config = {}
@@ -304,7 +303,6 @@ def batch_image_analyze(
         table_cfg.setdefault('device', 'GPU')
         table_cfg.setdefault('performance_hint', 'THROUGHPUT')
         table_cfg.setdefault('performance_num_requests', 4)
-        table_cfg.setdefault('inference_num_threads', 1)
 
         # Enable OpenVINO GPU model cache to skip JIT on restart
         try:
@@ -326,13 +324,11 @@ def batch_image_analyze(
             if 'GPU' in ov_core.available_devices:
                 mem_bytes = int(ov_core.get_property('GPU', 'GPU_DEVICE_TOTAL_MEM_SIZE'))
                 gpu_memory = round(mem_bytes / (1024 ** 3))
-                if gpu_memory >= 16:
-                    batch_ratio = 16
-                elif gpu_memory >= 12:
+                if gpu_memory >= 24:
                     batch_ratio = 8
-                elif gpu_memory >= 8:
+                elif gpu_memory >= 12:
                     batch_ratio = 4
-                elif gpu_memory >= 6:
+                elif gpu_memory >= 8:
                     batch_ratio = 2
                 else:
                     batch_ratio = 1

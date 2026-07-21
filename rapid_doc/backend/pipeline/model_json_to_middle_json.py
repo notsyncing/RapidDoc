@@ -425,9 +425,15 @@ def _post_process_ocr(middle_json, lang, ocr_config):
             lang=lang,
             ocr_config=ocr_config,
         )
-        
-        ocr_res_list = ocr_model.ocr(img_crop_list, det=False, tqdm_enable=True)[0]
-        
+
+        # Chunk large batches to avoid GPU OOM on small VRAM
+        GPU_OCR_CHUNK = 128
+        ocr_res_list = []
+        for start_i in range(0, len(img_crop_list), GPU_OCR_CHUNK):
+            chunk = img_crop_list[start_i:start_i + GPU_OCR_CHUNK]
+            chunk_res = ocr_model.ocr(chunk, det=False, tqdm_enable=True)[0]
+            ocr_res_list.extend(chunk_res)
+
         assert len(ocr_res_list) == len(need_ocr_list), \
             f'ocr_res_list: {len(ocr_res_list)}, need_ocr_list: {len(need_ocr_list)}'
         

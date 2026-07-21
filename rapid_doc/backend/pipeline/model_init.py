@@ -154,7 +154,6 @@ class MineruPipelineModel:
                 layout_cfg['device'] = 'GPU'
             layout_cfg.setdefault('performance_hint', 'THROUGHPUT')
             layout_cfg.setdefault('performance_num_requests', 4)
-            layout_cfg.setdefault('inference_num_threads', 1)
 
             if not self.table_config:
                 self.table_config = {}
@@ -165,7 +164,6 @@ class MineruPipelineModel:
                 table_cfg['device'] = 'GPU'
             table_cfg.setdefault('performance_hint', 'THROUGHPUT')
             table_cfg.setdefault('performance_num_requests', 4)
-            table_cfg.setdefault('inference_num_threads', 1)
 
             # Enable OpenVINO GPU cache
             try:

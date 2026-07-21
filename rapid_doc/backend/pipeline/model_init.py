@@ -139,8 +139,8 @@ class MineruPipelineModel:
         self.ocr_config = kwargs.get('ocr_config')
         self.formula_config = kwargs.get('formula_config')
         self.apply_formula = self.formula_config.get('enable', True)
-        self.table_config = kwargs.get('table_config')
-        self.apply_table = self.table_config.get('enable', True)
+        self.table_config = kwargs.get('table_config') or {}
+        self.apply_table = self.table_config.pop('enable', True)
         self.lang = kwargs.get('lang', None)
         self.device = kwargs.get('device', 'cpu')
 
@@ -149,19 +149,33 @@ class MineruPipelineModel:
                 self.layout_config = {}
             if 'engine_type' not in self.layout_config:
                 self.layout_config['engine_type'] = LayoutEngineType.OPENVINO
-            if 'engine_cfg' not in self.layout_config:
-                self.layout_config['engine_cfg'] = {}
-            if 'device' not in self.layout_config['engine_cfg']:
-                self.layout_config['engine_cfg']['device'] = 'GPU'
+            layout_cfg = self.layout_config.setdefault('engine_cfg', {})
+            if 'device' not in layout_cfg:
+                layout_cfg['device'] = 'GPU'
+            layout_cfg.setdefault('performance_hint', 'THROUGHPUT')
+            layout_cfg.setdefault('performance_num_requests', 4)
+            layout_cfg.setdefault('inference_num_threads', 1)
 
             if not self.table_config:
                 self.table_config = {}
             if 'engine_type' not in self.table_config:
                 self.table_config['engine_type'] = TableEngineType.OPENVINO
-            if 'engine_cfg' not in self.table_config:
-                self.table_config['engine_cfg'] = {}
-            if 'device' not in self.table_config['engine_cfg']:
-                self.table_config['engine_cfg']['device'] = 'GPU'
+            table_cfg = self.table_config.setdefault('engine_cfg', {})
+            if 'device' not in table_cfg:
+                table_cfg['device'] = 'GPU'
+            table_cfg.setdefault('performance_hint', 'THROUGHPUT')
+            table_cfg.setdefault('performance_num_requests', 4)
+            table_cfg.setdefault('inference_num_threads', 1)
+
+            # Enable OpenVINO GPU cache
+            try:
+                import os
+                cache_dir = os.path.join(os.path.expanduser('~'), '.cache', 'openvino_gpu_cache')
+                os.makedirs(cache_dir, exist_ok=True)
+                layout_cfg.setdefault('cache_dir', cache_dir)
+                table_cfg.setdefault('cache_dir', cache_dir)
+            except Exception:
+                pass
 
         logger.info(
             'DocAnalysis init, this may take some times......'

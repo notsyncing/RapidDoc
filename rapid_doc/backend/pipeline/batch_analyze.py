@@ -4,6 +4,7 @@
 """
 import os
 import inspect
+from collections import defaultdict
 from typing import List, Tuple, Dict, Optional
 
 import cv2
@@ -12,13 +13,14 @@ from PIL import Image
 from loguru import logger
 from tqdm import tqdm
 
-from .analyze_utils import _extract_text_from_pdf, _run_ocr_det_batch, _process_single_table, _run_ocr_rec_postprocess
+from .analyze_utils import _extract_text_from_pdf, _run_ocr_det_batch, _process_single_table, _run_ocr_rec_postprocess, _prepare_table_data, _run_batched_table_inference
 from .model_init import AtomModelSingleton
 from .model_list import AtomicModel
 from ..utils.utils import remove_layout_in_ori_images, filter_overlap_boxes, _expand_formula_crop_res
 from ...model.custom import CustomBaseModel
 from ...utils.bbox_utils import normalize_to_int_bbox
 from ...utils.boxbase import get_rotate_image, restore_poly
+from ...utils.ocr_utils import get_rotate_crop_image
 from ...utils.checkbox_det_cls import checkbox_predict
 from ...utils.config_reader import get_formula_enable, get_table_enable
 from ...utils.enum_class import CategoryId
@@ -58,17 +60,25 @@ class BatchAnalyze:
         
         # OCR 配置
         self.use_det_mode = self.ocr_config.get("use_det_mode", "auto")
-        self.ocr_det_base_batch_size = self.ocr_config.get("Det.rec_batch_num", 1)
+        base_ocr = self.ocr_config.get("Det.rec_batch_num", 1)
+        self.ocr_det_base_batch_size = base_ocr * self.batch_ratio
+        # 写回 config 使 _run_ocr_det_batch 等函数读到放大后的值
+        if self.batch_ratio > 1:
+            self.ocr_config["Det.rec_batch_num"] = self.ocr_det_base_batch_size
+            base_rec = self.ocr_config.get("Rec.rec_batch_num", 1)
+            self.ocr_config["Rec.rec_batch_num"] = base_rec * self.batch_ratio
         self.seal_enable = self.ocr_config.get("seal_enable", True)
         self.use_custom_ocr = False
         
         # 版面配置
-        self.layout_base_batch_size = self.layout_config.get("batch_num", 1)
+        base_layout = self.layout_config.get("batch_num", 1)
+        self.layout_base_batch_size = base_layout * self.batch_ratio
         self.use_doc_orientation_classify = (str(os.getenv("USE_DOC_ORIENTATION_CLASSIFY", "false"))
                                              .strip().lower() in ("true", "1", "yes", "on"))
         # 公式配置
         self.formula_level = self.formula_config.get("formula_level", 0)
-        self.formula_base_batch_size = self.formula_config.get("batch_num", 1)
+        base_formula = self.formula_config.get("batch_num", 1)
+        self.formula_base_batch_size = base_formula * self.batch_ratio
         self.formula_bbox_expand_px = int(self.formula_config.get("bbox_expand_px", 2))
         
         # 表格配置
@@ -382,7 +392,6 @@ class BatchAnalyze:
         else:
             # 传统模式表格识别
             self._run_traditional_table_recognition(atom_model_manager, table_res_all_page, pdf_dict_list, scale_list)
-
     def _run_traditional_table_recognition(
         self,
         atom_model_manager,
@@ -390,26 +399,125 @@ class BatchAnalyze:
         pdf_dict_list: List[Dict],
         scale_list: List[float]
     ):
-        """传统表格识别处理"""
+        """传统表格识别 —— 跨表格 batch 分类器+检测+OCR-rec+结构推理"""
         table_res_grouped = {}
         for x in table_res_all_page:
             table_res_grouped.setdefault(x["page_idx"], []).append(x)
-
         total_tables = sum(len(tables) for tables in table_res_grouped.values())
 
+        # Phase 0: compute global max det image size for GPU uniform padding
+        RES_STRIDE = 64
+        max_h = max_w = 0
+        for page_idx, table_list in table_res_grouped.items():
+            for td in table_list:
+                td["table_img"] = td["rect_table_img"]
+                h, w = td["rect_table_img"].shape[:2]
+                max_h = max(max_h, ((h + RES_STRIDE - 1) // RES_STRIDE) * RES_STRIDE)
+                max_w = max(max_w, ((w + RES_STRIDE - 1) // RES_STRIDE) * RES_STRIDE)
+
+        uniform_det_size = (max_h, max_w) if max_h > 0 else None
+
+        # Phase 1a: batch table classifier
+        table_model = atom_model_manager.get_atom_model(
+            atom_model_name='table', lang='ch', ocr_config=self.ocr_config,
+            table_config=self.table_config,
+        )
+        precomputed_classes = {}
+        if hasattr(table_model, 'table_cls'):
+            try:
+                all_imgs = []
+                idx_map = []
+                for page_idx, table_list in table_res_grouped.items():
+                    for td in table_list:
+                        td["table_img"] = td["rect_table_img"]
+                        all_imgs.append(cv2.cvtColor(np.asarray(td["table_img"]), cv2.COLOR_RGB2BGR))
+                        idx_map.append((page_idx, id(td)))
+                if all_imgs:
+                    cls_results, cls_scores, _ = table_model.table_cls(all_imgs, batch_size=32, return_scores=True)
+                    for (pi, tid), cls, score in zip(idx_map, cls_results, cls_scores):
+                        precomputed_classes[tid] = (cls, score)
+            except Exception:
+                pass
+
+        # Phase 1b: per-table preprocessing
+        batch_entries = []
         with tqdm(total=total_tables, desc="Table Predict") as pbar:
             for page_idx, table_list in table_res_grouped.items():
                 page_dict = pdf_dict_list[page_idx]
                 scale = scale_list[page_idx]
-
                 for table_res_dict in table_list:
                     table_res_dict["table_img"] = table_res_dict["rect_table_img"]
-                    _process_single_table(
+                    pc = precomputed_classes.get(id(table_res_dict))
+                    result = _prepare_table_data(
                         table_res_dict, page_dict, scale, atom_model_manager,
-                        self.table_config,
-                        self.ocr_config,
+                        self.table_config, self.ocr_config,
+                        skip_table_rec=True,
+                        uniform_det_size=uniform_det_size,
+                        precomputed_table_class=pc,
                     )
+                    if result is not None:
+                        batch_entries.append(result)
                     pbar.update(1)
+
+        # Phase 1c: cross-table batch OCR-rec for deferred entries
+        deferred_indices = []
+        all_crops = []
+        for idx, entry in enumerate(batch_entries):
+            pk = entry[2]
+            deferred = pk.pop('_deferred_rec', None)
+            if deferred is None:
+                continue
+            ocr_model, bgr_image, det_res, table_use_word_box, ocr_cfg = deferred
+            for det_box in det_res:
+                crop = get_rotate_crop_image(bgr_image, np.asarray(det_box, dtype=np.float32))
+                all_crops.append((crop, idx))
+            deferred_indices.append(idx)
+
+        if all_crops:
+            crop_imgs = [c[0] for c in all_crops]
+            max_h = max(img.shape[0] for img in crop_imgs)
+            max_w = max(img.shape[1] for img in crop_imgs)
+            padded_imgs = []
+            for img in crop_imgs:
+                h, w = img.shape[:2]
+                if h < max_h or w < max_w:
+                    p = np.ones((max_h, max_w, 3), dtype=np.uint8) * 255
+                    p[:h, :w] = img
+                    padded_imgs.append(p)
+                else:
+                    padded_imgs.append(img)
+
+            ocr_model = atom_model_manager.get_atom_model(
+                atom_model_name=AtomicModel.OCR,
+                lang=batch_entries[deferred_indices[0]][2].get('_lang', 'ch'),
+                ocr_config=self.ocr_config,
+            )
+            rec_model = getattr(getattr(ocr_model, 'ocr_engine', None), 'text_rec', None)
+            if rec_model is not None and hasattr(rec_model, 'cfg') and hasattr(rec_model.cfg, 'rec_batch_num'):
+                rec_model.cfg.rec_batch_num = len(padded_imgs)
+            try:
+                rec_results_raw = ocr_model.ocr(padded_imgs, det=False, tqdm_enable=False)[0]
+            except Exception:
+                rec_results_raw = None
+
+            idx_to_crops = defaultdict(list)
+            for (crop_img, tbl_idx), rec_res in zip(all_crops, rec_results_raw or []):
+                idx_to_crops[tbl_idx].append(rec_res or ('', 0.0))
+
+            for tbl_idx in deferred_indices:
+                pk = batch_entries[tbl_idx][2]
+                recs = idx_to_crops.get(tbl_idx, [])
+                dt_boxes = [np.asarray(det_box, dtype=np.float32) for det_box in
+                            pk.get('_det_res', [])]
+                if recs:
+                    texts = [r[0] if isinstance(r, (list, tuple)) else '' for r in recs]
+                    scores = [float(r[1]) if isinstance(r, (list, tuple)) else 0.0 for r in recs]
+                    pk['ocr_result'] = [dt_boxes, texts, scores]
+                else:
+                    pk['ocr_result'] = []
+
+        # Phase 2: batched model inference grouped by wired/wireless
+        _run_batched_table_inference(self.table_config, batch_entries)
 
 
     def _run_seal_ocr(

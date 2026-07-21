@@ -53,11 +53,28 @@ class TSRUnetStructurer:
         self.cfg = cfg
 
     def __call__(
-        self, img: np.ndarray, **kwargs
+        self, img, **kwargs
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if isinstance(img, list):
+            return self._batch_call(img, **kwargs)
         img_info = self.preprocess(img)
         pred = self.infer(img_info)
         polygons, rotated_polygons = self.postprocess(img, pred, **kwargs)
+        return self._finalize_polygons(polygons, rotated_polygons)
+
+    def _batch_call(
+        self, imgs: List[np.ndarray], **kwargs
+    ) -> List[Tuple[Optional[np.ndarray], Optional[np.ndarray]]]:
+        results = []
+        for img in imgs:
+            img_info = self.preprocess(img)
+            pred = self.infer(img_info)
+            polygons, rotated_polygons = self.postprocess(img, pred, **kwargs)
+            results.append(self._finalize_polygons(polygons, rotated_polygons))
+        return results
+
+    @staticmethod
+    def _finalize_polygons(polygons, rotated_polygons):
         if polygons.size == 0:
             return None, None
         polygons = polygons.reshape(polygons.shape[0], 4, 2)
@@ -93,7 +110,6 @@ class TSRUnetStructurer:
         return {"img": images}
 
     def infer(self, input):
-        # result = self.session(input["img"][None, ...])[0][0]
         result = self.session(input["img"])[0][0]
         result = result[0].astype(np.uint8)
         return result

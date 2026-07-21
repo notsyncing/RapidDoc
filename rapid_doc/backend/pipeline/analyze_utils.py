@@ -15,6 +15,7 @@ from .model_init import AtomModelSingleton
 from .model_list import AtomicModel
 from ...model.table.utils import normalize_table_ocr_text
 from ...model.table.rule_table import build_rule_table, build_track_table
+from ...model.table.utils import normalize_table_html_cell_text
 from ...utils.bbox_utils import normalize_to_int_bbox
 from ...utils.boxbase import rotate_table_image
 from ...utils.enum_class import CategoryId
@@ -167,31 +168,27 @@ def _run_ocr_det_batch(
             ocr_config=ocr_config,
         )
 
-        # 按分辨率分组
-        resolution_groups = defaultdict(list)
-        for info in lang_crop_list:
-            cropped_img = info[1]
-            h, w = cropped_img.shape[:2]
-            # 直接计算目标尺寸并用作分组键
-            target_h = ((h + RESOLUTION_GROUP_STRIDE - 1) // RESOLUTION_GROUP_STRIDE) * RESOLUTION_GROUP_STRIDE
-            target_w = ((w + RESOLUTION_GROUP_STRIDE - 1) // RESOLUTION_GROUP_STRIDE) * RESOLUTION_GROUP_STRIDE
-            group_key = (target_h, target_w)
-            resolution_groups[group_key].append(info)
+        # GPU 模式：所有 crop 统一 pad 到全局最大尺寸 → 单一 GPU shape → 无需重编译
+        device = ocr_config.get("Det.device", "cpu")
+        if "gpu" in device.lower() or "openvino" in device.lower():
+            max_h = max_w = 0
+            for info in lang_crop_list:
+                h, w = info[1].shape[:2]
+                max_h = max(max_h, ((h + RESOLUTION_GROUP_STRIDE - 1) // RESOLUTION_GROUP_STRIDE) * RESOLUTION_GROUP_STRIDE)
+                max_w = max(max_w, ((w + RESOLUTION_GROUP_STRIDE - 1) // RESOLUTION_GROUP_STRIDE) * RESOLUTION_GROUP_STRIDE)
 
-        # 对每个分辨率组进行批处理
-        for (target_h, target_w), group_crops in tqdm(resolution_groups.items(), desc=f"OCR-det {lang}"):
             batch_images = []
-            for info in group_crops:
-                img = info[1] # _det_image
+            for info in tqdm(lang_crop_list, desc=f"OCR-det {lang}"):
+                img = info[1]
                 h, w = img.shape[:2]
-                padded_img = np.ones((target_h, target_w, 3), dtype=np.uint8) * 255
-                padded_img[:h, :w] = img
-                batch_images.append(padded_img)
+                padded = np.ones((max_h, max_w, 3), dtype=np.uint8) * 255
+                padded[:h, :w] = img
+                batch_images.append(padded)
 
             det_batch_size = min(len(batch_images), ocr_det_base_batch_size)
             batch_results = ocr_model.det_batch_predict(batch_images, det_batch_size)
 
-            for info, (dt_boxes, _) in zip(group_crops, batch_results):
+            for info, (dt_boxes, _) in zip(lang_crop_list, batch_results):
                 bgr_image, _det_image, useful_list, ocr_res_dict, adjusted_mfdetrec_res, _lang, res, ocr_enable = info
 
                 if dt_boxes is not None and len(dt_boxes) > 0:
@@ -211,6 +208,48 @@ def _run_ocr_det_batch(
                             _lang, res['original_label'], res['original_order']
                         )
                         ocr_res_dict['layout_res'].extend(ocr_result_list)
+        else:
+            # CPU 模式：按分辨率分组，避免无用 padding 增大计算量
+            resolution_groups = defaultdict(list)
+            for info in lang_crop_list:
+                cropped_img = info[1]
+                h, w = cropped_img.shape[:2]
+                target_h = ((h + RESOLUTION_GROUP_STRIDE - 1) // RESOLUTION_GROUP_STRIDE) * RESOLUTION_GROUP_STRIDE
+                target_w = ((w + RESOLUTION_GROUP_STRIDE - 1) // RESOLUTION_GROUP_STRIDE) * RESOLUTION_GROUP_STRIDE
+                resolution_groups[(target_h, target_w)].append(info)
+
+            for (target_h, target_w), group_crops in tqdm(resolution_groups.items(), desc=f"OCR-det {lang}"):
+                batch_images = []
+                for info in group_crops:
+                    img = info[1]
+                    h, w = img.shape[:2]
+                    padded_img = np.ones((target_h, target_w, 3), dtype=np.uint8) * 255
+                    padded_img[:h, :w] = img
+                    batch_images.append(padded_img)
+
+                det_batch_size = min(len(batch_images), ocr_det_base_batch_size)
+                batch_results = ocr_model.det_batch_predict(batch_images, det_batch_size)
+
+                for info, (dt_boxes, _) in zip(group_crops, batch_results):
+                    bgr_image, _det_image, useful_list, ocr_res_dict, adjusted_mfdetrec_res, _lang, res, ocr_enable = info
+
+                    if dt_boxes is not None and len(dt_boxes) > 0:
+                        dt_boxes_sorted = sorted_boxes(dt_boxes)
+                        dt_boxes_merged = merge_det_boxes(dt_boxes_sorted) if dt_boxes_sorted else []
+
+                        dt_boxes_final = (
+                            update_det_boxes(dt_boxes_merged, adjusted_mfdetrec_res)
+                            if dt_boxes_merged and adjusted_mfdetrec_res
+                            else dt_boxes_merged
+                        )
+
+                        if dt_boxes_final:
+                            ocr_res = [box.tolist() if hasattr(box, 'tolist') else box for box in dt_boxes_final]
+                            ocr_result_list = get_ocr_result_list(
+                                ocr_res, useful_list, ocr_enable, bgr_image,
+                                _lang, res['original_label'], res['original_order']
+                            )
+                            ocr_res_dict['layout_res'].extend(ocr_result_list)
 
 
 # =================================== OCR-rec ===================================
@@ -250,8 +289,43 @@ def _run_ocr_rec_postprocess(images_layout_res: List[List[Dict]], ocr_config):
             ocr_config=ocr_config,
         )
 
+        # GPU 模式：uniform padding + 固定 batch 消除 JIT 重编译
+        device = ocr_config.get("Rec.device", "cpu")
+        rec_input_list = img_crop_list
+        rec_input_final = rec_input_list
+        _orig_n = len(rec_input_list)
+        if "gpu" in device.lower() or "openvino" in device.lower():
+            max_h = max(img.shape[0] for img in img_crop_list)
+            max_w = max(img.shape[1] for img in img_crop_list)
+            rec_input_list = []
+            for img in img_crop_list:
+                h, w = img.shape[:2]
+                if h < max_w or w < max_w:
+                    padded = np.ones((max_h, max_w, 3), dtype=np.uint8) * 255
+                    padded[:h, :w] = img
+                    rec_input_list.append(padded)
+                else:
+                    rec_input_list.append(img)
+            # GPU batch: 固定大小 power-of-2，不足时 padd 到整倍数 → 所有 batch 同 shape → 只 JIT 一次
+            rec_input_final = rec_input_list
+            rec_model = ocr_model.ocr_engine.text_rec
+            if hasattr(rec_model, 'cfg') and hasattr(rec_model.cfg, 'rec_batch_num'):
+                GPU_BATCH = 128
+                n = _orig_n
+                if n > GPU_BATCH:
+                    pad = (GPU_BATCH - n % GPU_BATCH) % GPU_BATCH
+                    if pad:
+                        dummy = np.zeros_like(rec_input_list[0])
+                        rec_input_final = rec_input_list + [dummy] * pad
+                    rec_model.cfg.rec_batch_num = GPU_BATCH
+                else:
+                    rec_model.cfg.rec_batch_num = n
+
         try:
-            ocr_res_list = ocr_model.ocr(img_crop_list, det=False, tqdm_enable=True)[0]
+            ocr_res_list = ocr_model.ocr(rec_input_final, det=False, tqdm_enable=True)[0]
+            # 丢弃 padd 的 dummy 结果
+            if len(ocr_res_list) > _orig_n:
+                ocr_res_list = ocr_res_list[:_orig_n]
         except Exception as exc:
             logger.warning(f'OCR-rec batch failed, retry one by one: {exc}')
             ocr_res_list = []
@@ -332,28 +406,28 @@ def _detect_table_text(
     return restored.tolist()
 
 
-def _process_single_table(
+def _prepare_table_data(
         table_res_dict: Dict,
         page_dict: Dict,
         scale: float,
         atom_model_manager: AtomModelSingleton,
         table_config,
         ocr_config,
+        skip_table_rec: bool = False,
+        uniform_det_size: Tuple[int, int] = None,
+        precomputed_table_class: tuple = None,
 ):
-    """处理单个表格"""
-    # 表格配置
-    table_force_ocr = table_config.get("force_ocr", False)
-    skip_text_in_image = table_config.get("skip_text_in_image", True)
-    use_img2table = table_config.get("use_img2table", False)
-    table_use_word_box = table_config.get("use_word_box", False)
-    table_formula_enable = table_config.get("table_formula_enable", True)
-    table_image_enable = table_config.get("table_image_enable", True)
-    table_extract_original_image = table_config.get("extract_original_image", False)
-    use_rule_table = table_config.get("use_rule_table", True)
-    rule_table_score_threshold = float(table_config.get("rule_table_score_threshold", 0.90))
-    ocr_det_retry_padding = int(table_config.get("ocr_det_retry_padding", 8))
-    ocr_det_retry_short_side = int(table_config.get("ocr_det_retry_short_side", 32))
-
+    """表格预处理：rule check → OCR → rotation → fill_image，返回 predict 所需参数。
+    
+    Args:
+        skip_table_rec: 若为 True，推迟表格内 OCR-rec，将原始 crop 信息存入
+            predict_kwargs['_deferred_rec']，供调用方跨表格 batch 处理。
+    """
+    (table_force_ocr, skip_text_in_image, use_img2table, table_use_word_box,
+     table_formula_enable, table_image_enable, table_extract_original_image,
+     use_rule_table, rule_table_score_threshold,
+     ocr_det_retry_padding, ocr_det_retry_short_side,
+     ) = _parse_table_config(table_config)
 
     _lang = table_res_dict['lang']
     useful_list = table_res_dict['useful_list']
@@ -382,7 +456,9 @@ def _process_single_table(
         and pdf_not_rotate
         and hasattr(table_model, 'rule_table_class')
     )
-    if native_rule_candidate:
+    if precomputed_table_class is not None:
+        table_class, table_class_score = precomputed_table_class
+    elif native_rule_candidate:
         try:
             table_class, table_class_score = table_model.rule_table_class(table_res_dict['table_img'])
             if table_class == "wired":
@@ -410,7 +486,7 @@ def _process_single_table(
                         table_res_dict['table_res']['html'] = rule_result.html
                         table_res_dict['table_res']['rule_table_score'] = rule_result.score
                         table_res_dict['table_res']['table_parse_method'] = 'pdfium_rule'
-                        return
+                        return None  # rule-based success
         except Exception as exc:
             logger.warning(f'PDFium rule table failed, fallback to model: {exc}')
 
@@ -434,13 +510,19 @@ def _process_single_table(
         if adjusted_mfdetrec_res
         else bgr_image
     )
+    # GPU 模式：表格检测图统一 pad 到全局最大尺寸 → 单一输入 shape → 一次 JIT
+    device = ocr_config.get("Det.device", "cpu")
+    if uniform_det_size is not None and ("gpu" in str(device).lower()):
+        tgt_h, tgt_w = uniform_det_size
+        h, w = det_image.shape[:2]
+        if h < tgt_h or w < tgt_w:
+            padded = np.ones((tgt_h, tgt_w, 3), dtype=np.uint8) * 255
+            padded[:h, :w] = det_image
+            det_image = padded
     det_res = _detect_table_text(
-        ocr_model,
-        det_image,
-        adjusted_mfdetrec_res,
-        retry_padding=ocr_det_retry_padding,
-        retry_short_side=ocr_det_retry_short_side,
-    )
+            ocr_model, det_image, adjusted_mfdetrec_res,
+            retry_padding=ocr_det_retry_padding, retry_short_side=ocr_det_retry_short_side,
+        )
 
     angles = []
     rotate_label = "0"
@@ -463,11 +545,8 @@ def _process_single_table(
             else bgr_image
         )
         det_res = _detect_table_text(
-            ocr_model,
-            det_image,
-            adjusted_mfdetrec_res,
-            retry_padding=ocr_det_retry_padding,
-            retry_short_side=ocr_det_retry_short_side,
+            ocr_model, det_image, adjusted_mfdetrec_res,
+            retry_padding=ocr_det_retry_padding, retry_short_side=ocr_det_retry_short_side,
         )
 
     ocr_result = []
@@ -478,8 +557,10 @@ def _process_single_table(
             table_res_dict, page_dict, scale, det_res, useful_list, table_use_word_box
         )
 
-    # 如果提取失败，使用 OCR
-    if not ocr_result and det_res:
+    needs_rec = not ocr_result and det_res
+    if skip_table_rec and needs_rec:
+        ocr_result = []
+    elif needs_rec:
         ocr_result = _run_table_ocr(ocr_model, bgr_image, det_res, table_use_word_box)
 
     fill_image_res = []
@@ -492,41 +573,117 @@ def _process_single_table(
 
     table_res_dict['table_res'].pop('layout_image_list', None)
 
-    predict_kwargs = {'skip_table_orientation': True}
-    if hasattr(table_model, 'rule_table_class'):
-        predict_kwargs.update(
-            table_class=table_class,
-            table_class_score=table_class_score,
-        )
-    html_code = table_model.predict(
-        table_res_dict['table_img'], ocr_result,
-        fill_image_res, adjusted_mfdetrec_res,
-        skip_text_in_image, use_img2table,
-        **predict_kwargs,
+    predict_kwargs = dict(
+        image=table_res_dict['table_img'],
+        ocr_result=ocr_result,
+        fill_image_res=fill_image_res,
+        mfd_res=adjusted_mfdetrec_res,
+        skip_text_in_image=skip_text_in_image,
+        use_img2table=use_img2table,
+        skip_table_orientation=True,
     )
+    if hasattr(table_model, 'rule_table_class'):
+        predict_kwargs.update(table_class=table_class, table_class_score=table_class_score)
 
+    if skip_table_rec and needs_rec:
+        predict_kwargs['_deferred_rec'] = (ocr_model, bgr_image, det_res, table_use_word_box, ocr_config)
+
+    return (table_res_dict, table_model, predict_kwargs)
+
+
+def _parse_table_config(table_config):
+    """提取并返回表格配置参数元组。"""
+    table_force_ocr = table_config.get("force_ocr", False)
+    skip_text_in_image = table_config.get("skip_text_in_image", True)
+    use_img2table = table_config.get("use_img2table", False)
+    table_use_word_box = table_config.get("use_word_box", False)
+    table_formula_enable = table_config.get("table_formula_enable", True)
+    table_image_enable = table_config.get("table_image_enable", True)
+    table_extract_original_image = table_config.get("extract_original_image", False)
+    use_rule_table = table_config.get("use_rule_table", True)
+    rule_table_score_threshold = float(table_config.get("rule_table_score_threshold", 0.90))
+    ocr_det_retry_padding = int(table_config.get("ocr_det_retry_padding", 8))
+    ocr_det_retry_short_side = int(table_config.get("ocr_det_retry_short_side", 32))
+    return (table_force_ocr, skip_text_in_image, use_img2table, table_use_word_box,
+            table_formula_enable, table_image_enable, table_extract_original_image,
+            use_rule_table, rule_table_score_threshold,
+            ocr_det_retry_padding, ocr_det_retry_short_side)
+
+
+def _run_batched_table_inference(table_config, batch_data: List[tuple]):
+    """对一批预处理后的表格执行分组 batch 推理。"""
+    from ...model.table.rapid_table_self import ModelType
+
+    if not batch_data:
+        return
+
+    model_type = table_config.get("model_type", "UNET_SLANET_PLUS")
+    is_combined = str(model_type) in ["UNET_SLANET_PLUS", "UNET_SLANET1M", "UNET_UNITABLE"]
+
+    # Collect per-table result holders while grouping
+    wired_entries, wireless_entries = [], []
+    for entry in batch_data:
+        table_res_dict, table_model, pk = entry
+        if is_combined and pk.get('table_class') == "wired":
+            wired_entries.append(entry)
+        elif is_combined and pk.get('table_class') == "wireless":
+            wireless_entries.append(entry)
+        else:
+            # Single-model or unclassified → run individually
+            html_code = table_model.predict(**pk)
+            _write_table_result(table_res_dict, html_code)
+
+    def _batch_group(entries, attr_name):
+        if not entries:
+            return
+        imgs = [e[2]['image'] for e in entries]
+        ocrs = [e[2]['ocr_result'] for e in entries]
+        model = getattr(entries[0][1], attr_name, None)
+        if model is None:
+            for e in entries:
+                html_code = e[1].predict(**e[2])
+                _write_table_result(e[0], html_code)
+            return
+        bs = min(len(imgs), 16)
+        try:
+            batch_htmls = model(imgs, ocrs, batch_size=bs).pred_htmls
+        except Exception:
+            for e in entries:
+                html_code = e[1].predict(**e[2])
+                _write_table_result(e[0], html_code)
+            return
+        for entry, html_code in zip(entries, batch_htmls):
+            _write_table_result(entry[0], normalize_table_html_cell_text(html_code) if html_code else None)
+
+    _batch_group(wired_entries, 'wired_table_model')
+    _batch_group(wireless_entries, 'wireless_table_model')
+
+
+def _write_table_result(table_res_dict, html_code):
     if html_code and '<table>' in html_code and '</table>' in html_code:
-        start_index = html_code.find('<table>')
-        end_index = html_code.rfind('</table>') + len('</table>')
-        table_res_dict['table_res']['html'] = html_code[start_index:end_index]
-
-        # 保存公式和图片位置信息
-        formula_boxes = [
-            t["bbox"] for t in table_res_dict['single_page_mfdetrec_res'] + table_res_dict['checkbox_res']
-            if "bbox" in t
-        ]
-        if formula_boxes:
-            table_res_dict['table_res']['formula_boxes'] = [
-                [int(coord / scale) for coord in bbox] for bbox in formula_boxes
-            ]
-
-        img_boxes = [t["ori_bbox"] for t in fill_image_res if "bbox" in t]
-        if img_boxes:
-            table_res_dict['table_res']['img_boxes'] = [
-                [int(coord / scale) for coord in bbox] for bbox in img_boxes
-            ]
+        start = html_code.find('<table>')
+        end = html_code.rfind('</table>') + len('</table>')
+        table_res_dict['table_res']['html'] = html_code[start:end]
     else:
         logger.warning('table recognition processing fails')
+
+
+def _process_single_table(
+        table_res_dict: Dict,
+        page_dict: Dict,
+        scale: float,
+        atom_model_manager: AtomModelSingleton,
+        table_config,
+        ocr_config,
+):
+    """处理单个表格"""
+    result = _prepare_table_data(table_res_dict, page_dict, scale,
+                                 atom_model_manager, table_config, ocr_config)
+    if result is None:
+        return  # rule-based success
+    table_res_dict, table_model, predict_kwargs = result
+    html_code = table_model.predict(**predict_kwargs)
+    _write_table_result(table_res_dict, html_code)
 
 
 def _boxes_overlap(a, b) -> bool:
@@ -599,6 +756,34 @@ def _run_table_ocr(
         })
 
     cropped_img_list = [item["cropped_img"] for item in rec_img_list]
+
+    # 统一尺寸消除 GPU shape 重编译
+    max_h = max(img.shape[0] for img in cropped_img_list)
+    max_w = max(img.shape[1] for img in cropped_img_list)
+    uniform_list = []
+    for img in cropped_img_list:
+        h, w = img.shape[:2]
+        if h < max_h or w < max_w:
+            padded = np.ones((max_h, max_w, 3), dtype=np.uint8) * 255
+            padded[:h, :w] = img
+            uniform_list.append(padded)
+        else:
+            uniform_list.append(img)
+    cropped_img_list = uniform_list
+    # GPU batch: 固定大小 power-of-2，余数 padd → 所有 batch 同 shape → 一次 JIT
+    rec_model = getattr(getattr(ocr_model, 'ocr_engine', None), 'text_rec', None)
+    _tbl_n = len(cropped_img_list)
+    if rec_model is not None and hasattr(rec_model, 'cfg') and hasattr(rec_model.cfg, 'rec_batch_num'):
+        GPU_BATCH = 128
+        if _tbl_n > GPU_BATCH:
+            pad = (GPU_BATCH - _tbl_n % GPU_BATCH) % GPU_BATCH
+            if pad:
+                dummy = np.zeros_like(cropped_img_list[0])
+                cropped_img_list = cropped_img_list + [dummy] * pad
+            rec_model.cfg.rec_batch_num = GPU_BATCH
+        else:
+            rec_model.cfg.rec_batch_num = _tbl_n
+
     ocr_res_list = None
     try:
         ocr_res_list = ocr_model.ocr(

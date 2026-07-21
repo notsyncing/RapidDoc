@@ -278,7 +278,11 @@ def batch_image_analyze(
         if layout_config is None:
             layout_config = {}
         layout_config.setdefault('engine_type', LayoutEngineType.OPENVINO)
-        layout_config.setdefault('engine_cfg', {}).setdefault('device', 'GPU')
+        layout_cfg = layout_config.setdefault('engine_cfg', {})
+        layout_cfg.setdefault('device', 'GPU')
+        layout_cfg.setdefault('performance_hint', 'THROUGHPUT')
+        layout_cfg.setdefault('performance_num_requests', 4)
+        layout_cfg.setdefault('inference_num_threads', 1)
 
         if ocr_config is None:
             ocr_config = {}
@@ -288,11 +292,53 @@ def batch_image_analyze(
         ocr_config.setdefault('Det.device', 'GPU')
         ocr_config.setdefault('Rec.device', 'GPU')
         ocr_config.setdefault('Cls.device', 'GPU')
+        # GPU 上增加 OCR batch 大小，让小模型也能充分利用 GPU 吞吐
+        ocr_config.setdefault('Det.rec_batch_num', 32)
+        ocr_config.setdefault('Rec.rec_batch_num', 32)
+        ocr_config.setdefault('Cls.cls_batch_num', 32)
 
         if table_config is None:
             table_config = {}
         table_config.setdefault('engine_type', TableEngineType.OPENVINO)
-        table_config.setdefault('engine_cfg', {}).setdefault('device', 'GPU')
+        table_cfg = table_config.setdefault('engine_cfg', {})
+        table_cfg.setdefault('device', 'GPU')
+        table_cfg.setdefault('performance_hint', 'THROUGHPUT')
+        table_cfg.setdefault('performance_num_requests', 4)
+        table_cfg.setdefault('inference_num_threads', 1)
+
+        # Enable OpenVINO GPU model cache to skip JIT on restart
+        try:
+            import openvino as ov
+            cache_dir = os.path.join(os.path.expanduser('~'), '.cache', 'openvino_gpu_cache')
+            os.makedirs(cache_dir, exist_ok=True)
+            ov_core = ov.Core()
+            ov_core.set_property("GPU", {"CACHE_DIR": cache_dir})
+            layout_cfg.setdefault('cache_dir', cache_dir)
+            table_cfg.setdefault('cache_dir', cache_dir)
+            logger.info(f'OpenVINO GPU cache dir: {cache_dir}')
+        except Exception:
+            pass
+
+        # Auto-compute batch_ratio from GPU memory
+        try:
+            import openvino as ov
+            ov_core = ov.Core()
+            if 'GPU' in ov_core.available_devices:
+                mem_bytes = int(ov_core.get_property('GPU', 'GPU_DEVICE_TOTAL_MEM_SIZE'))
+                gpu_memory = round(mem_bytes / (1024 ** 3))
+                if gpu_memory >= 16:
+                    batch_ratio = 16
+                elif gpu_memory >= 12:
+                    batch_ratio = 8
+                elif gpu_memory >= 8:
+                    batch_ratio = 4
+                elif gpu_memory >= 6:
+                    batch_ratio = 2
+                else:
+                    batch_ratio = 1
+                logger.info(f'GPU memory: {gpu_memory} GB, batch_ratio: {batch_ratio}')
+        except Exception:
+            logger.info('Could not determine GPU memory, using default batch_ratio: 1')
 
     if str(device).startswith('npu'):
         try:

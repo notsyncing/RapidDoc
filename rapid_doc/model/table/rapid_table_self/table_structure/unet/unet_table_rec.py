@@ -50,19 +50,23 @@ class UnetTableRecognition:
             col_threshold = kwargs.get("col_threshold", 15)
             row_threshold = kwargs.get("row_threshold", 10)
 
+        struct_results = self.table_structure(ori_imgs, **kwargs)
+
         pred_htmls, cell_bboxes, logic_points_list = [], [], []
         for i, img in enumerate(ori_imgs):
-
-            ocr_result = list(
-                zip(ocr_results[i][0], ocr_results[i][1], ocr_results[i][2])
-            )
-            polygons, rotated_polygons = self.table_structure(img, **kwargs)
+            polygons, rotated_polygons = struct_results[i]
             if polygons is None:
                 pred_htmls.append("")
                 cell_bboxes.append([])
                 logic_points_list.append([])
-                # logging.warning("polygons is None.")
                 continue
+
+            try:
+                ocr_result = list(
+                    zip(ocr_results[i][0], ocr_results[i][1], ocr_results[i][2])
+                ) if ocr_results[i] else []
+            except (IndexError, TypeError):
+                ocr_result = []
 
             try:
                 table_res, logi_points = self.table_recover(

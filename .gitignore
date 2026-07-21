@@ -54,3 +54,4 @@ tools/
 output*/
 
 **/rapid_*_self/**/models/*
+build/

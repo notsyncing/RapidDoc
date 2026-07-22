@@ -137,7 +137,7 @@ class OpenVINOInferSession(InferSession):
             self.infer_request.wait()  # 等待推理完成
 
             output_tensor_name = self.output_tensors[0].get_any_name()
-            output = self.infer_request.get_tensor(output_tensor_name).data
+            output = np.array(self.infer_request.get_tensor(output_tensor_name).data)
 
             del self.infer_request
             self.infer_request = self.compiled_model.create_infer_request()

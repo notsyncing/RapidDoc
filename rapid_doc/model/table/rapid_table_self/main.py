@@ -151,8 +151,12 @@ class RapidTable:
             for img, ocr_result in zip(imgs, ocr_results_batch):
                 img_h, img_w = img.shape[:2]
                 dt_boxes, rec_res = format_ocr_results(ocr_result, img_h, img_w)
-                batch_dt_boxes.append(dt_boxes)
-                batch_rec_res.append(rec_res)
+                if len(dt_boxes) == 0:
+                    batch_dt_boxes.append(None)
+                    batch_rec_res.append(None)
+                else:
+                    batch_dt_boxes.append(dt_boxes)
+                    batch_rec_res.append(rec_res)
             return batch_dt_boxes, batch_rec_res
 
         if not self.cfg.use_ocr:

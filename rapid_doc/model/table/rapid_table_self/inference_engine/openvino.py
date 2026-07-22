@@ -101,7 +101,7 @@ class OpenVINOInferSession(InferSession):
             outputs = []
             for output_tensor in self.output_tensors:
                 output_tensor_name = output_tensor.get_any_name()
-                output = self.infer_request.get_tensor(output_tensor_name).data
+                output = np.array(self.infer_request.get_tensor(output_tensor_name).data)
                 outputs.append(output)
 
             del self.infer_request

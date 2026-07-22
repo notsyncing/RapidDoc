@@ -18,6 +18,9 @@ def format_ocr_results(
     rec_res = list(zip(ocr_results[1], ocr_results[2]))
 
     bboxes = np.array(ocr_results[0])
+    if bboxes.size == 0:
+        return np.empty((0, 4), dtype=np.float32), []
+
     min_coords = bboxes[..., :2].min(axis=1)
     max_coords = bboxes[..., :2].max(axis=1)
 

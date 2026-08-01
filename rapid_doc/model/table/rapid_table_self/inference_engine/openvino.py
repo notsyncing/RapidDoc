@@ -88,6 +88,13 @@ class OpenVINOInferSession(InferSession):
             if scheduling_core_type is not None:
                 config["SCHEDULING_CORE_TYPE"] = str(scheduling_core_type)
 
+        device = cfg.get('engine_cfg', {}).get('device', 'CPU')
+        if device.upper() == 'GPU':
+            # 允许 GPU 分配超过设备默认单块上限（常见 4GB）的 buffer，
+            # 避免大输入触发 "Exceeded max size of memory object allocation"。
+            enable_large_allocations = engine_cfg.get("enable_large_allocations", True)
+            config["GPU_ENABLE_LARGE_ALLOCATIONS"] = bool(enable_large_allocations)
+
         self.logger.info(f"Using OpenVINO config: {config}")
         return config
 

@@ -45,13 +45,29 @@ class RapidLayout:
         # 先读取所有图片
         img_contents = [self.load_img(img_content) for img_content in img_contents]
         batch_results = []
-        with tqdm(total=len(img_contents), desc="Layout Predict", disable=not tqdm_enable) as pbar:
+        _orig_n = len(img_contents)
+        _pad = 0
+        # OpenVINO GPU: pad the last batch to batch_size so the dynamic batch
+        # dimension never changes. Switching batch shapes on the GPU plugin can
+        # corrupt the compiled model (spurious full-page detections, missed
+        # tables), see e.g. A380 (batch_ratio=1) vs A770 (batch_ratio=4).
+        if batch_size > 1 and str(getattr(self.session, 'device', 'CPU')).upper() == 'GPU':
+            _pad = (batch_size - _orig_n % batch_size) % batch_size
+            if _pad:
+                blank = np.zeros_like(img_contents[0])
+                img_contents = img_contents + [blank] * _pad
+
+        with tqdm(total=_orig_n, desc="Layout Predict", disable=not tqdm_enable) as pbar:
             # 分批处理
             for i in range(0, len(img_contents), batch_size):
                 batch_imgs = img_contents[i:i + batch_size]
                 results = self.model_handler(batch_imgs)
                 batch_results.extend(results)
-                pbar.update(len(batch_imgs))  # 用实际处理的数量更新进度条
+                n_real = min(batch_size, max(0, _orig_n - i))  # 用实际处理的数量更新进度条
+                pbar.update(n_real)
+
+        if _pad:
+            batch_results = batch_results[:_orig_n]
 
         return batch_results
 

@@ -47,6 +47,7 @@ class OpenVINOInferSession(InferSession):
 
         device = cfg.engine_cfg.get('device', 'CPU') if cfg.engine_cfg else 'CPU'
         ov_config = self._init_config(cfg)
+        self.device = device
 
         cache_key = f"{model_path}:{device}"
         if cache_key in _COMPILED_MODELS:
@@ -130,8 +131,12 @@ class OpenVINOInferSession(InferSession):
                 output = np.array(self.infer_request.get_tensor(output_tensor_name).data)
                 outputs.append(output)
 
-            del self.infer_request
-            self.infer_request = self.compiled_model.create_infer_request()
+            # NOTE: do NOT delete and recreate infer_request here. Recreating
+            # after every call makes the GPU plugin return empty/corrupted
+            # results from the second inference onward on Intel GPUs
+            # (Arc A770: full-page layout boxes after batch-shape switches;
+            # Iris Xe: empty outputs). Output tensors are copied with
+            # np.array() above, so no buffers are pinned by the caller.
 
             return outputs
 

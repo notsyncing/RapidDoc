@@ -139,8 +139,9 @@ class OpenVINOInferSession(InferSession):
             output_tensor_name = self.output_tensors[0].get_any_name()
             output = np.array(self.infer_request.get_tensor(output_tensor_name).data)
 
-            del self.infer_request
-            self.infer_request = self.compiled_model.create_infer_request()
+            # NOTE: do NOT delete and recreate infer_request here (see the
+            # layout engine): on Intel GPUs the recreated request returns
+            # empty/corrupted results from the second inference onward.
 
             return output
         except Exception as e:

@@ -79,7 +79,12 @@ class OpenVINOInferSession(InferSession):
 
         # CPU-only properties — skip for GPU to avoid plugin errors
         device = engine_cfg.get('device', 'CPU') if engine_cfg else 'CPU'
-        if device.upper() != 'GPU':
+        if device.upper() == 'GPU':
+            # 允许 GPU 分配超过设备默认单块上限（常见 4GB）的 buffer，
+            # 避免大输入触发 "Exceeded max size of memory object allocation"。
+            enable_large_allocations = engine_cfg.get("enable_large_allocations", True)
+            config["GPU_ENABLE_LARGE_ALLOCATIONS"] = bool(enable_large_allocations)
+        else:
             infer_num_threads = engine_cfg.get("inference_num_threads", -1)
             if infer_num_threads != -1 and 1 <= infer_num_threads <= os.cpu_count():
                 config["INFERENCE_NUM_THREADS"] = str(infer_num_threads)

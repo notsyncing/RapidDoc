@@ -477,15 +477,6 @@ class BatchAnalyze:
             crop_imgs = [c[0] for c in all_crops]
             max_h = max(img.shape[0] for img in crop_imgs)
             max_w = max(img.shape[1] for img in crop_imgs)
-            padded_imgs = []
-            for img in crop_imgs:
-                h, w = img.shape[:2]
-                if h < max_h or w < max_w:
-                    p = np.ones((max_h, max_w, 3), dtype=np.uint8) * 255
-                    p[:h, :w] = img
-                    padded_imgs.append(p)
-                else:
-                    padded_imgs.append(img)
 
             ocr_model = atom_model_manager.get_atom_model(
                 atom_model_name=AtomicModel.OCR,
@@ -493,12 +484,32 @@ class BatchAnalyze:
                 ocr_config=self.ocr_config,
             )
             rec_model = getattr(getattr(ocr_model, 'ocr_engine', None), 'text_rec', None)
+            GPU_BATCH = 128
             if rec_model is not None and hasattr(rec_model, 'cfg') and hasattr(rec_model.cfg, 'rec_batch_num'):
-                rec_model.cfg.rec_batch_num = len(padded_imgs)
-            try:
-                rec_results_raw = ocr_model.ocr(padded_imgs, det=False, tqdm_enable=False)[0]
-            except Exception:
-                rec_results_raw = None
+                rec_model.cfg.rec_batch_num = min(GPU_BATCH, len(crop_imgs))
+
+            # 按批 pad + 推理：全量 pad 到全局最大尺寸再一次性推理在表格
+            # 较多时可达数十 GB（数千 cell × max 尺寸），必须分批降低峰值。
+            rec_results_raw = []
+            for start in range(0, len(crop_imgs), GPU_BATCH):
+                batch = crop_imgs[start:start + GPU_BATCH]
+                padded_imgs = []
+                for img in batch:
+                    h, w = img.shape[:2]
+                    if h < max_h or w < max_w:
+                        p = np.ones((max_h, max_w, 3), dtype=np.uint8) * 255
+                        p[:h, :w] = img
+                        padded_imgs.append(p)
+                    else:
+                        padded_imgs.append(img)
+                try:
+                    batch_res = ocr_model.ocr(padded_imgs, det=False, tqdm_enable=False)[0]
+                except Exception as exc:
+                    logger.warning(f'table OCR-rec batch failed, use empty results: {exc}')
+                    batch_res = []
+                if len(batch_res) != len(batch):
+                    batch_res = (batch_res + [('', 0.0)] * len(batch))[:len(batch)]
+                rec_results_raw.extend(batch_res)
 
             idx_to_crops = defaultdict(list)
             for (crop_img, tbl_idx), rec_res in zip(all_crops, rec_results_raw or []):

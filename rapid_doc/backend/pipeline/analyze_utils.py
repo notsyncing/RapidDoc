@@ -3,8 +3,10 @@
 批量分析模块
 """
 import copy
+import os
 from typing import List, Dict
 from collections import defaultdict
+from functools import lru_cache
 
 import cv2
 import numpy as np
@@ -104,6 +106,68 @@ def _apply_mask_boxes_to_image(
 
     return masked_image
 
+
+_DET_MEM_BUDGET_MIN = 256 * 1024 ** 2  # 256 MB
+_DET_MEM_BUDGET_MAX = 512 * 1024 ** 2  # 512 MB：单批 f32 输入预算
+
+
+@lru_cache(maxsize=1)
+def _gpu_det_mem_budget() -> int:
+    """OCR-det 单次推理输入张量的显存预算（字节）。
+
+    Intel GPU 即使总显存很大，单块 buffer 分配也存在上限
+    （GPU_DEVICE_MAX_ALLOC_MEM_SIZE，常见 4GB）；同时 det 输入只是整条
+    GPU 管线（布局/表格/公式/rec + THROUGHPUT 多请求）的一部分，预算
+    需同时受单块上限和总显存比例约束，避免吃满设备显存导致进程 OOM。
+    iGPU 共享内存下，f32 输入还会在系统内存里再占一份（预分配 buffer）
+    且 GPU 拷贝同样落在系统内存，加上首批 JIT 编译时的激活池峰值，
+    预算上限保持 512MB 保守。可用环境变量 RAPID_DOC_DET_MEM_BUDGET_MB
+    覆盖（单位 MB）。
+
+    GPU 属性进程内不变，用 lru_cache 保证只查询一次。
+    """
+    hard_max = _DET_MEM_BUDGET_MAX
+    env_mb = os.getenv("RAPID_DOC_DET_MEM_BUDGET_MB")
+    if env_mb:
+        try:
+            hard_max = max(int(env_mb) * 1024 ** 2, _DET_MEM_BUDGET_MIN)
+        except ValueError:
+            pass
+    try:
+        import openvino as ov
+        core = ov.Core()
+        if 'GPU' in core.available_devices:
+            total_mem = int(core.get_property('GPU', 'GPU_DEVICE_TOTAL_MEM_SIZE'))
+            budget = int(total_mem * 0.15)
+            try:
+                max_alloc = int(core.get_property('GPU', 'GPU_DEVICE_MAX_ALLOC_MEM_SIZE'))
+                budget = min(budget, int(max_alloc * 0.6))
+            except Exception:
+                # 该属性在部分 OpenVINO 版本/驱动上不存在，降级为总显存比例预算
+                logger.warning(
+                    'Failed to query GPU_DEVICE_MAX_ALLOC_MEM_SIZE, '
+                    'fall back to total-memory ratio budget'
+                )
+            return min(max(budget, _DET_MEM_BUDGET_MIN), hard_max)
+    except Exception:
+        # openvino 未安装 / GPU 不可用 / 查询失败，降级为默认预算
+        logger.warning(
+            f'Failed to query GPU memory, use default det budget '
+            f'{hard_max / (1024 ** 3):.1f}GB'
+        )
+    return hard_max
+
+
+def _gpu_safe_det_batch_size(max_h: int, max_w: int, requested: int) -> int:
+    """按显存预算限制 OCR-det 的 batch 大小，防止输入张量
+    （NCHW f32：batch * 3 * H * W * 4 字节）超过设备单次分配上限。"""
+    if requested <= 1:
+        return requested
+    bytes_per_img = max_h * max_w * 3 * 4
+    budget = _gpu_det_mem_budget()
+    safe = max(1, budget // max(bytes_per_img, 1))
+    return min(requested, safe)
+
 def _run_ocr_det_batch(
         ocr_res_all_page: List[Dict],
         atom_model_manager: AtomModelSingleton,
@@ -114,7 +178,9 @@ def _run_ocr_det_batch(
     use_det_mode = ocr_config.get("use_det_mode", "auto")
     ocr_det_base_batch_size = ocr_config.get("Det.rec_batch_num", 1)
 
-    all_cropped_info = []
+    # 按语言直接分组，避免额外的全局列表持有 bgr_image 引用，
+    # 大文档下全量 crop 可达数 GB，处理完一批即释放。
+    lang_groups = defaultdict(list)
 
     for ocr_res_dict in ocr_res_all_page:
         for res in ocr_res_dict['ocr_res_list']:
@@ -138,23 +204,16 @@ def _run_ocr_det_batch(
             )
 
             bgr_image = cv2.cvtColor(new_image, cv2.COLOR_RGB2BGR)
-            det_image = _apply_mask_boxes_to_image(
-                bgr_image,
-                adjusted_mfdetrec_res,
-            )
 
-            all_cropped_info.append((
-                bgr_image, det_image, useful_list, ocr_res_dict,
+            # NOTE: 不在此生成 det_image（mask 拷贝），改为在推理时按批
+            # 即时生成，避免大文档下全量 crop 的额外拷贝驻留系统内存。
+            lang_groups[ocr_res_dict['lang']].append((
+                bgr_image, None, useful_list, ocr_res_dict,
                 adjusted_mfdetrec_res, ocr_res_dict['lang'], res, ocr_enable
             ))
 
-    if not all_cropped_info:
+    if not lang_groups:
         return
-
-    # 按语言分组
-    lang_groups = defaultdict(list)
-    for info in all_cropped_info:
-        lang_groups[info[5]].append(info)
 
     RESOLUTION_GROUP_STRIDE = 64
 
@@ -173,46 +232,60 @@ def _run_ocr_det_batch(
         if "gpu" in device.lower() or "openvino" in device.lower():
             max_h = max_w = 0
             for info in lang_crop_list:
-                h, w = info[1].shape[:2]
+                bgr_image, _, _, _, adjusted_mfdetrec_res, _, _, _ = info
+                det_image = _apply_mask_boxes_to_image(bgr_image, adjusted_mfdetrec_res)
+                h, w = det_image.shape[:2]
                 max_h = max(max_h, ((h + RESOLUTION_GROUP_STRIDE - 1) // RESOLUTION_GROUP_STRIDE) * RESOLUTION_GROUP_STRIDE)
                 max_w = max(max_w, ((w + RESOLUTION_GROUP_STRIDE - 1) // RESOLUTION_GROUP_STRIDE) * RESOLUTION_GROUP_STRIDE)
 
-            batch_images = []
-            for info in tqdm(lang_crop_list, desc=f"OCR-det {lang}"):
-                img = info[1]
-                h, w = img.shape[:2]
-                padded = np.ones((max_h, max_w, 3), dtype=np.uint8) * 255
-                padded[:h, :w] = img
-                batch_images.append(padded)
+            det_batch_size = min(len(lang_crop_list), ocr_det_base_batch_size)
+            det_batch_size = _gpu_safe_det_batch_size(max_h, max_w, det_batch_size)
 
-            det_batch_size = min(len(batch_images), ocr_det_base_batch_size)
-            batch_results = ocr_model.det_batch_predict(batch_images, det_batch_size)
+            # 按批 pad + 推理：避免全量 crop 的 pad 副本驻留系统内存
+            # （大文档下可达数 GB），每批推理完立即处理并释放。
+            for start in tqdm(range(0, len(lang_crop_list), det_batch_size), desc=f"OCR-det {lang}"):
+                batch_info = lang_crop_list[start:start + det_batch_size]
+                batch_images = []
+                for info in batch_info:
+                    bgr_image, _, _, _, adjusted_mfdetrec_res, _, _, _ = info
+                    det_image = _apply_mask_boxes_to_image(bgr_image, adjusted_mfdetrec_res)
+                    h, w = det_image.shape[:2]
+                    padded = np.ones((max_h, max_w, 3), dtype=np.uint8) * 255
+                    padded[:h, :w] = det_image
+                    batch_images.append(padded)
 
-            for info, (dt_boxes, _) in zip(lang_crop_list, batch_results):
-                bgr_image, _det_image, useful_list, ocr_res_dict, adjusted_mfdetrec_res, _lang, res, ocr_enable = info
+                batch_results = ocr_model.det_batch_predict(batch_images, det_batch_size)
 
-                if dt_boxes is not None and len(dt_boxes) > 0:
-                    dt_boxes_sorted = sorted_boxes(dt_boxes)
-                    dt_boxes_merged = merge_det_boxes(dt_boxes_sorted) if dt_boxes_sorted else []
+                for info, (dt_boxes, _) in zip(batch_info, batch_results):
+                    bgr_image, _det_image, useful_list, ocr_res_dict, adjusted_mfdetrec_res, _lang, res, ocr_enable = info
 
-                    dt_boxes_final = (
-                        update_det_boxes(dt_boxes_merged, adjusted_mfdetrec_res)
-                        if dt_boxes_merged and adjusted_mfdetrec_res
-                        else dt_boxes_merged
-                    )
+                    if dt_boxes is not None and len(dt_boxes) > 0:
+                        dt_boxes_sorted = sorted_boxes(dt_boxes)
+                        dt_boxes_merged = merge_det_boxes(dt_boxes_sorted) if dt_boxes_sorted else []
 
-                    if dt_boxes_final:
-                        ocr_res = [box.tolist() if hasattr(box, 'tolist') else box for box in dt_boxes_final]
-                        ocr_result_list = get_ocr_result_list(
-                            ocr_res, useful_list, ocr_enable, bgr_image,
-                            _lang, res['original_label'], res['original_order']
+                        dt_boxes_final = (
+                            update_det_boxes(dt_boxes_merged, adjusted_mfdetrec_res)
+                            if dt_boxes_merged and adjusted_mfdetrec_res
+                            else dt_boxes_merged
                         )
-                        ocr_res_dict['layout_res'].extend(ocr_result_list)
+
+                        if dt_boxes_final:
+                            ocr_res = [box.tolist() if hasattr(box, 'tolist') else box for box in dt_boxes_final]
+                            ocr_result_list = get_ocr_result_list(
+                                ocr_res, useful_list, ocr_enable, bgr_image,
+                                _lang, res['original_label'], res['original_order']
+                            )
+                            ocr_res_dict['layout_res'].extend(ocr_result_list)
+
+                # 处理完该批立即释放 bgr_image 引用，避免全量驻留
+                for i in range(start, start + len(batch_info)):
+                    lang_crop_list[i] = None
         else:
             # CPU 模式：按分辨率分组，避免无用 padding 增大计算量
             resolution_groups = defaultdict(list)
             for info in lang_crop_list:
-                cropped_img = info[1]
+                bgr_image, _, _, _, adjusted_mfdetrec_res, _, _, _ = info
+                cropped_img = _apply_mask_boxes_to_image(bgr_image, adjusted_mfdetrec_res)
                 h, w = cropped_img.shape[:2]
                 target_h = ((h + RESOLUTION_GROUP_STRIDE - 1) // RESOLUTION_GROUP_STRIDE) * RESOLUTION_GROUP_STRIDE
                 target_w = ((w + RESOLUTION_GROUP_STRIDE - 1) // RESOLUTION_GROUP_STRIDE) * RESOLUTION_GROUP_STRIDE
@@ -221,7 +294,8 @@ def _run_ocr_det_batch(
             for (target_h, target_w), group_crops in tqdm(resolution_groups.items(), desc=f"OCR-det {lang}"):
                 batch_images = []
                 for info in group_crops:
-                    img = info[1]
+                    bgr_image, _, _, _, adjusted_mfdetrec_res, _, _, _ = info
+                    img = _apply_mask_boxes_to_image(bgr_image, adjusted_mfdetrec_res)
                     h, w = img.shape[:2]
                     padded_img = np.ones((target_h, target_w, 3), dtype=np.uint8) * 255
                     padded_img[:h, :w] = img
@@ -291,62 +365,63 @@ def _run_ocr_rec_postprocess(images_layout_res: List[List[Dict]], ocr_config):
 
         # GPU 模式：uniform padding + 固定 batch 消除 JIT 重编译
         device = ocr_config.get("Rec.device", "cpu")
-        rec_input_list = img_crop_list
-        rec_input_final = rec_input_list
-        _orig_n = len(rec_input_list)
+        _orig_n = len(img_crop_list)
+        ocr_res_list = []
         if "gpu" in device.lower() or "openvino" in device.lower():
             max_h = max(img.shape[0] for img in img_crop_list)
             max_w = max(img.shape[1] for img in img_crop_list)
-            rec_input_list = []
-            for img in img_crop_list:
-                h, w = img.shape[:2]
-                if h < max_w or w < max_w:
-                    padded = np.ones((max_h, max_w, 3), dtype=np.uint8) * 255
-                    padded[:h, :w] = img
-                    rec_input_list.append(padded)
-                else:
-                    rec_input_list.append(img)
-            # GPU batch: 固定大小 power-of-2，不足时 padd 到整倍数 → 所有 batch 同 shape → 只 JIT 一次
-            rec_input_final = rec_input_list
+            # GPU batch: 固定大小 power-of-2 → 所有 batch 同 shape → 只 JIT 一次
+            GPU_BATCH = 128
             rec_model = ocr_model.ocr_engine.text_rec
             if hasattr(rec_model, 'cfg') and hasattr(rec_model.cfg, 'rec_batch_num'):
-                GPU_BATCH = 128
-                n = _orig_n
-                if n > GPU_BATCH:
-                    pad = (GPU_BATCH - n % GPU_BATCH) % GPU_BATCH
-                    if pad:
-                        dummy = np.zeros_like(rec_input_list[0])
-                        rec_input_final = rec_input_list + [dummy] * pad
-                    rec_model.cfg.rec_batch_num = GPU_BATCH
-                else:
-                    rec_model.cfg.rec_batch_num = n
+                rec_model.cfg.rec_batch_num = min(GPU_BATCH, _orig_n)
 
-        try:
-            ocr_res_list = ocr_model.ocr(rec_input_final, det=False, tqdm_enable=True)[0]
-            # 丢弃 padd 的 dummy 结果
-            if len(ocr_res_list) > _orig_n:
-                ocr_res_list = ocr_res_list[:_orig_n]
-        except Exception as exc:
-            logger.warning(f'OCR-rec batch failed, retry one by one: {exc}')
-            ocr_res_list = []
-            safe_items = []
-            for item, img_crop in zip(need_ocr_by_lang[lang], img_crop_list):
+            # 按批 pad + 推理：避免全量 crop 的 pad 副本驻留系统内存
+            # （大文档下可达数 GB），每批推理完立即释放。
+            GPU_BATCH = 128
+            for start in range(0, _orig_n, GPU_BATCH):
+                batch = img_crop_list[start:start + GPU_BATCH]
+                batch_padded = []
+                for img in batch:
+                    h, w = img.shape[:2]
+                    if h < max_h or w < max_w:
+                        padded = np.ones((max_h, max_w, 3), dtype=np.uint8) * 255
+                        padded[:h, :w] = img
+                        batch_padded.append(padded)
+                    else:
+                        batch_padded.append(img)
                 try:
-                    one_res = ocr_model.ocr([img_crop], det=False, tqdm_enable=False)[0]
-                except Exception as one_exc:
-                    logger.warning(f'skip failed OCR-rec crop: {one_exc}')
-                    item['text'] = ''
-                    item['score'] = 0.0
-                    item['category_id'] = CategoryId.LowScoreText
-                    continue
-                if not one_res:
-                    item['text'] = ''
-                    item['score'] = 0.0
-                    item['category_id'] = CategoryId.LowScoreText
-                    continue
-                ocr_res_list.append(one_res[0])
-                safe_items.append(item)
-            need_ocr_by_lang[lang] = safe_items
+                    batch_res = ocr_model.ocr(batch_padded, det=False, tqdm_enable=True)[0]
+                except Exception as exc:
+                    logger.warning(f'OCR-rec batch failed, retry one by one: {exc}')
+                    batch_res = []
+                    for img_crop in batch:
+                        try:
+                            one_res = ocr_model.ocr([img_crop], det=False, tqdm_enable=False)[0]
+                        except Exception as one_exc:
+                            logger.warning(f'skip failed OCR-rec crop: {one_exc}')
+                            one_res = []
+                        batch_res.append(one_res[0] if one_res else ("", 0.0))
+                if len(batch_res) != len(batch):
+                    logger.warning(
+                        f'OCR-rec batch returned {len(batch_res)}/{len(batch)} results, padding'
+                    )
+                    batch_res = batch_res[:len(batch)]
+                    batch_res += [("", 0.0)] * (len(batch) - len(batch_res))
+                ocr_res_list.extend(batch_res)
+        else:
+            try:
+                ocr_res_list = ocr_model.ocr(img_crop_list, det=False, tqdm_enable=True)[0]
+            except Exception as exc:
+                logger.warning(f'OCR-rec batch failed, retry one by one: {exc}')
+                ocr_res_list = []
+                for img_crop in img_crop_list:
+                    try:
+                        one_res = ocr_model.ocr([img_crop], det=False, tqdm_enable=False)[0]
+                    except Exception as one_exc:
+                        logger.warning(f'skip failed OCR-rec crop: {one_exc}')
+                        one_res = []
+                    ocr_res_list.append(one_res[0] if one_res else ("", 0.0))
 
         assert len(ocr_res_list) == len(need_ocr_by_lang[lang])
 

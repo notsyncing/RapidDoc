@@ -317,24 +317,13 @@ def batch_image_analyze(
         except Exception:
             pass
 
-        # Auto-compute batch_ratio from GPU memory
-        try:
-            import openvino as ov
-            ov_core = ov.Core()
-            if 'GPU' in ov_core.available_devices:
-                mem_bytes = int(ov_core.get_property('GPU', 'GPU_DEVICE_TOTAL_MEM_SIZE'))
-                gpu_memory = round(mem_bytes / (1024 ** 3))
-                if gpu_memory >= 24:
-                    batch_ratio = 8
-                elif gpu_memory >= 12:
-                    batch_ratio = 4
-                elif gpu_memory >= 8:
-                    batch_ratio = 2
-                else:
-                    batch_ratio = 1
-                logger.info(f'GPU memory: {gpu_memory} GB, batch_ratio: {batch_ratio}')
-        except Exception:
-            logger.info('Could not determine GPU memory, using default batch_ratio: 1')
+        # batch_ratio 固定为 1：OpenVINO 各模型的输入张量和激活池都随
+        # batch 线性增长并驻留，放大 batch 会同步放大整条 GPU 管线的
+        # 内存峰值（iGPU 共享内存下直接计入系统内存，8 倍放大曾导致
+        # 64 页大文档 OOM）。batch_ratio=1 + det 显存预算限制已在
+        # test2.pdf 全流程验证：峰值 9.3GB，系统可用内存全程 ≥3.7GB。
+        # 吞吐可通过 Det.rec_batch_num 等 batch 配置单独调节。
+        batch_ratio = 1
 
     if str(device).startswith('npu'):
         try:

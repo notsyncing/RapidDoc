@@ -535,20 +535,26 @@ class RapidOcrModel(object):
                 total_elapse: 总耗时
             """
         starttime = time.time()
-        # 1、前置处理
-        prepro_img_list = []
-
-        for img in img_list:
+        # 1、前置处理：预分配 batch buffer 直接填充，
+        # 避免 prepro_img_list + concatenate 两份 f32 副本同时驻留内存
+        # （大 batch 下可达数 GB，iGPU 共享内存环境易触发系统 OOM）。
+        img_inputs = None
+        prepro_shape = None
+        for i, img in enumerate(img_list):
             ori_img_shape = img.shape[0], img.shape[1]
             self.text_detector.preprocess_op = self.text_detector.get_preprocess(max(img.shape[0], img.shape[1]))
             prepro_img = self.text_detector.preprocess_op(img)
             if prepro_img is None:
                 return [(None, 0) for _ in img_list], 0
-
-            prepro_img_list.append(prepro_img)
-
-        # 拼接 batch
-        img_inputs = np.concatenate(prepro_img_list, axis=0)
+            if img_inputs is None:
+                # prepro_img 形如 (1, 3, H, W)，去掉 batch 维
+                prepro_shape = prepro_img.shape
+                img_inputs = np.empty((len(img_list),) + prepro_img.shape[1:], dtype=np.float32)
+            elif prepro_img.shape != prepro_shape:
+                raise ValueError(
+                    f'inconsistent preprocessed shapes: {prepro_shape} vs {prepro_img.shape}'
+                )
+            img_inputs[i] = prepro_img[0]
 
         # 2、批处理推理
         batch_preds = self.text_detector.session(img_inputs)

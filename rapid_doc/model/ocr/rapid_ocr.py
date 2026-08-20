@@ -538,23 +538,39 @@ class RapidOcrModel(object):
         # 1、前置处理：预分配 batch buffer 直接填充，
         # 避免 prepro_img_list + concatenate 两份 f32 副本同时驻留内存
         # （大 batch 下可达数 GB，iGPU 共享内存环境易触发系统 OOM）。
+        if not img_list:
+            return [], 0
+
+        # 同一批图像尺寸一致，preprocess 的 resize 目标与 limit_side_len 相同，
+        # 只需创建一次 DetPreProcess 并统一完成 resize + 归一化 + 转置。
         img_inputs = None
         prepro_shape = None
+        preprocess_op = None
+
         for i, img in enumerate(img_list):
             ori_img_shape = img.shape[0], img.shape[1]
-            self.text_detector.preprocess_op = self.text_detector.get_preprocess(max(img.shape[0], img.shape[1]))
-            prepro_img = self.text_detector.preprocess_op(img)
-            if prepro_img is None:
+            if preprocess_op is None:
+                preprocess_op = self.text_detector.get_preprocess(max(img.shape[0], img.shape[1]))
+            resized_img = preprocess_op.resize(img)
+            if resized_img is None:
                 return [(None, 0) for _ in img_list], 0
             if img_inputs is None:
-                # prepro_img 形如 (1, 3, H, W)，去掉 batch 维
-                prepro_shape = prepro_img.shape
-                img_inputs = np.empty((len(img_list),) + prepro_img.shape[1:], dtype=np.float32)
-            elif prepro_img.shape != prepro_shape:
+                prepro_shape = (3,) + resized_img.shape[:2]
+                img_inputs = np.empty((len(img_list),) + prepro_shape, dtype=np.float32)
+            elif resized_img.shape[:2] != img_inputs.shape[2:]:
                 raise ValueError(
-                    f'inconsistent preprocessed shapes: {prepro_shape} vs {prepro_img.shape}'
+                    f'inconsistent preprocessed shapes: {img_inputs.shape[2:]} '
+                    f'vs {resized_img.shape[:2]}'
                 )
-            img_inputs[i] = prepro_img[0]
+
+            # 融合归一化 + 转置，直接写入预分配 buffer：
+            # 与原实现 `(resized.astype(f32) * scale - mean) / std` 运算顺序一致，
+            # 但用 in-place 运算省去 3 份临时数组与一次 extra copy。
+            out = resized_img.astype(np.float32)
+            out *= preprocess_op.scale
+            out -= preprocess_op.mean
+            out /= preprocess_op.std
+            img_inputs[i] = out.transpose(2, 0, 1)
 
         # 2、批处理推理
         batch_preds = self.text_detector.session(img_inputs)

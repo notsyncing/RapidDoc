@@ -3,6 +3,7 @@
 模型输出转换为中间 JSON 格式
 """
 import os
+import numpy as np
 from tqdm import tqdm
 
 from rapid_doc.backend.utils.utils import cross_page_table_merge
@@ -26,6 +27,17 @@ from rapid_doc.utils.span_pre_proc import (
 )
 from rapid_doc.version import __version__
 from rapid_doc.utils.hash_utils import bytes_md5
+
+
+def _page_thumb_bytes(pil_img, stride: int = 8):
+    """对页面图降采样后取字节，用于生成稳定的页面缓存 key。
+
+    原实现对整张 200DPI 页面图（~11MB/页）做 md5，17 页耗时约 0.3s。
+    这里用 strided 视图抽取 ~1/64 像素（~180KB），碰撞概率对缓存 key
+    而言可忽略，同时保留页面内容的区分度。
+    """
+    arr = np.asarray(pil_img)
+    return np.ascontiguousarray(arr[::stride, ::stride]).tobytes()
 
 
 def page_model_info_to_page_info(
@@ -58,7 +70,7 @@ def page_model_info_to_page_info(
     """
     scale = image_dict["scale"]
     page_pil_img = image_dict["img_pil"]
-    page_img_md5 = bytes_md5(page_pil_img.tobytes())
+    page_img_md5 = bytes_md5(_page_thumb_bytes(page_pil_img))
     page_w, page_h = map(int, page_dict['size'])
     
     magic_model = MagicModel(page_model_info, scale)

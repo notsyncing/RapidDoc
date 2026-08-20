@@ -39,6 +39,18 @@ def patch_text_detector():
     # 覆盖原始方法
     TextDetector.get_preprocess = new_get_preprocess
 
+    # 融合归一化：原实现 `(img.astype(f32) * scale - mean) / std` 会依次
+    # 产生 3 份临时数组；改为 in-place 运算只保留一份 f32 副本，结果在
+    # float32 舍入误差内与原实现一致（差值 ~1e-7，对推理无影响）。
+    def new_normalize(self, img: np.ndarray) -> np.ndarray:
+        out = img.astype(np.float32)
+        out *= self.scale
+        out -= self.mean
+        out /= self.std
+        return out
+
+    DetPreProcess.normalize = new_normalize
+
 
 def patch_torch_ocr():
     """优化 PyTorch OCR 推理性能"""

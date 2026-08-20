@@ -36,7 +36,11 @@ class PPPreProcess:
         return img
 
     def normalize(self, img: np.ndarray) -> np.ndarray:
-        return (img.astype("float32") * self.scale - self.mean) / self.std
+        out = img.astype("float32")
+        out *= self.scale
+        out -= self.mean
+        out /= self.std
+        return out
 
     def permute(self, img: np.ndarray) -> np.ndarray:
         return img.transpose((2, 0, 1))

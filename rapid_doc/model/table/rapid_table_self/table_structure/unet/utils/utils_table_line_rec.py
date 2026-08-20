@@ -11,19 +11,33 @@ import numpy as np
 class ConnectedComponent:
     """保存连通域的 bbox、bbox 面积和懒加载坐标，字段语义对齐旧版 regionprops。"""
 
+    __slots__ = ("_labels", "_label_id", "bbox", "bbox_area", "pixel_area", "_coords")
+
     def __init__(
         self,
         labels: np.ndarray,
         label_id: int,
         bbox: tuple[int, int, int, int],
         bbox_area: int,
+        pixel_area: int,
     ):
         """记录组件基础信息，像素坐标延迟到真正参与几何计算时再生成。"""
         self._labels = labels
         self._label_id = label_id
         self.bbox = bbox
         self.bbox_area = bbox_area
+        self.pixel_area = pixel_area
         self._coords = None
+
+    @property
+    def is_solid_rect(self) -> bool:
+        """组件是否近似填满其轴对齐 bbox。
+
+        实心（pixel_area == bbox_area）或接近实心（填充率 ≥ 95%）的轴对齐
+        矩形，其 minAreaRect 只取决于 4 个角点，与全量像素一致；用角点替代
+        可跳过坐标提取与海量点集的最小外接矩形计算。
+        """
+        return self.pixel_area >= self.bbox_area * 0.95
 
     @property
     def coords(self) -> np.ndarray:
@@ -58,12 +72,30 @@ def _iter_connected_component_coords(binary_mask: np.ndarray) -> Iterator[Connec
         top = int(stats[label_id, cv2.CC_STAT_TOP])
         width = int(stats[label_id, cv2.CC_STAT_WIDTH])
         height = int(stats[label_id, cv2.CC_STAT_HEIGHT])
+        pixel_area = int(stats[label_id, cv2.CC_STAT_AREA])
         yield ConnectedComponent(
             labels=labels,
             label_id=label_id,
             bbox=(top, left, top + height, left + width),
             bbox_area=width * height,
+            pixel_area=pixel_area,
         )
+
+
+def _solid_rect_corner_coords(component) -> np.ndarray:
+    """实心轴对齐矩形的 4 个角点，行优先 (row, col) 约定与 component.coords 一致。
+
+    实心轴对齐矩形的像素坐标为闭区间 [left, right-1]×[top, bottom-1]，
+    其 minAreaRect 只取决于 4 个角点；用角点替代全量坐标可省去
+    np.nonzero + column_stack 的整块 ROI 扫描与海量点集的最小外接矩形计算。
+    """
+    top, left, bottom, right = component.bbox
+    x_max = right - 1
+    y_max = bottom - 1
+    return np.array(
+        [[top, left], [top, x_max], [y_max, x_max], [y_max, left]],
+        dtype=np.float32,
+    )
 
 
 def get_table_line(binimg, axis=0, lineW=10):
@@ -73,13 +105,17 @@ def get_table_line(binimg, axis=0, lineW=10):
     components = _iter_connected_component_coords(binimg > 0)
     if axis == 1:
         lineboxes = [
-            min_area_rect(component.coords)
+            min_area_rect(_solid_rect_corner_coords(component))
+            if component.is_solid_rect
+            else min_area_rect(component.coords)
             for component in components
             if component.bbox[2] - component.bbox[0] > lineW
         ]
     else:
         lineboxes = [
-            min_area_rect(component.coords)
+            min_area_rect(_solid_rect_corner_coords(component))
+            if component.is_solid_rect
+            else min_area_rect(component.coords)
             for component in components
             if component.bbox[3] - component.bbox[1] > lineW
         ]
@@ -182,7 +218,7 @@ def _order_points(pts):
 
 
 def sqrt(p1, p2):
-    return np.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
+    return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
 
 def adjust_lines(lines, alph=50, angle=50):
@@ -258,18 +294,16 @@ def line_to_line(points1, points2, alpha=10, angle=30):
     """
     x1, y1, x2, y2 = points1
     ox1, oy1, ox2, oy2 = points2
-    xy = np.array([(x1, y1), (x2, y2)], dtype="float32")
-    A1, B1, C1 = fit_line(xy)
-    oxy = np.array([(ox1, oy1), (ox2, oy2)], dtype="float32")
-    A2, B2, C2 = fit_line(oxy)
-    flag1 = point_line_cor(np.array([x1, y1], dtype="float32"), A2, B2, C2)
-    flag2 = point_line_cor(np.array([x2, y2], dtype="float32"), A2, B2, C2)
+    A1, B1, C1 = fit_line((x1, y1), (x2, y2))
+    A2, B2, C2 = fit_line((ox1, oy1), (ox2, oy2))
+    flag1 = point_line_cor(x1, y1, A2, B2, C2)
+    flag2 = point_line_cor(x2, y2, A2, B2, C2)
 
     if (flag1 > 0 and flag2 > 0) or (flag1 < 0 and flag2 < 0):  # 横线或者竖线在竖线或者横线的同一侧
-        if (A1 * B2 - A2 * B1) != 0:
-            x = (B1 * C2 - B2 * C1) / (A1 * B2 - A2 * B1)
-            y = (A2 * C1 - A1 * C2) / (A1 * B2 - A2 * B1)
-            # x, y = round(x, 2), round(y, 2)
+        det = A1 * B2 - A2 * B1
+        if det != 0:
+            x = (B1 * C2 - B2 * C1) / det
+            y = (A2 * C1 - A1 * C2) / det
             p = (x, y)  # 横线与竖线的交点
             r0 = sqrt(p, (x1, y1))
             r1 = sqrt(p, (x2, y2))
@@ -279,12 +313,12 @@ def line_to_line(points1, points2, alpha=10, angle=30):
                     k = abs((y2 - p[1]) / (x2 - p[0] + 1e-10))
                     a = math.atan(k) * 180 / math.pi
                     if a < angle or abs(90 - a) < angle:
-                        points1 = np.array([p[0], p[1], x2, y2], dtype="float32")
+                        points1 = (p[0], p[1], x2, y2)
                 else:
                     k = abs((y1 - p[1]) / (x1 - p[0] + 1e-10))
                     a = math.atan(k) * 180 / math.pi
                     if a < angle or abs(90 - a) < angle:
-                        points1 = np.array([x1, y1, p[0], p[1]], dtype="float32")
+                        points1 = (x1, y1, p[0], p[1])
     return points1
 
 
@@ -335,7 +369,20 @@ def min_area_rect_box_from_components(
     for component in components:
         if component.bbox_area > H * W * 3 / 4:  # 过滤大的单元格
             continue
-        rect = cv2.minAreaRect(component.coords[:, ::-1])
+        top, left, bottom, right = component.bbox
+        bw = right - left
+        bh = bottom - top
+        # minAreaRect 的旋转矩形包含全部点，任一边长 ≤ 点集直径 ≤ bbox 对角线。
+        # 因此 bbox 对角线 < 15 时两边长必 < 15，filtersmall 下必然被过滤，
+        # 直接跳过昂贵的 minAreaRect 计算。
+        if filtersmall and bw * bw + bh * bh < 225:
+            continue
+        if component.is_solid_rect:
+            # 实心轴对齐矩形：用 4 角点替代全量坐标，minAreaRect 结果与
+            # 全量像素完全一致（含 1px 退化情形），但省去整块 ROI 扫描。
+            rect = cv2.minAreaRect(_solid_rect_corner_coords(component)[:, ::-1])
+        else:
+            rect = cv2.minAreaRect(component.coords[:, ::-1])
 
         box = cv2.boxPoints(rect)
         box = box.reshape((8,)).tolist()
@@ -350,23 +397,21 @@ def min_area_rect_box_from_components(
             boxes.append([x1, y1, x2, y2, x3, y3, x4, y4])
     return boxes
 
-def point_line_cor(p, A, B, C):
+def point_line_cor(x, y, A, B, C):
     ##判断点与线之间的位置关系
     # 一般式直线方程(Ax+By+c)=0
-    x, y = p
-    r = A * x + B * y + C
-    return r
+    return A * x + B * y + C
 
 
-def fit_line(p):
+def fit_line(p1, p2):
     """A = Y2 - Y1
        B = X1 - X2
        C = X2*Y1 - X1*Y2
        AX+BY+C=0
     直线一般方程
     """
-    x1, y1 = p[0]
-    x2, y2 = p[1]
+    x1, y1 = p1
+    x2, y2 = p2
     A = y2 - y1
     B = x1 - x2
     C = x2 * y1 - x1 * y2

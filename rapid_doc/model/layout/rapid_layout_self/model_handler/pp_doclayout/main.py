@@ -111,8 +111,8 @@ class PPDocLayoutModelHandler(BaseModelHandler):
             pred_mask.append(pred[3])
             return [
                 {
-                    "class_id": np.array(pred_class_id[i]),
-                    "masks": np.array(pred_mask[i]),
+                    "class_id": np.asarray(pred_class_id[i]),
+                    "masks": np.asarray(pred_mask[i]),
                 }
                 for i in range(len(pred_class_id))
             ]
@@ -132,8 +132,8 @@ class PPDocLayoutModelHandler(BaseModelHandler):
 
         if len(pred) == 3:
             return [
-                {"boxes": np.array(pred_box[i]), "masks": np.array(pred_mask[i])}
+                {"boxes": np.asarray(pred_box[i]), "masks": np.asarray(pred_mask[i])}
                 for i in range(len(pred_box))
             ]
         else:
-            return [{"boxes": np.array(res)} for res in pred_box]
+            return [{"boxes": np.asarray(res)} for res in pred_box]

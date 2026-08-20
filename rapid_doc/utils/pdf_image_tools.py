@@ -290,7 +290,7 @@ def cut_image(span, ori_image_list, extract_original_image, extract_original_ima
     if not crop_img:
         crop_img = get_crop_img(bbox, page_pil_img, scale=scale)
 
-    img_bytes = image_to_bytes(crop_img, image_format="PNG")
+    img_bytes = image_to_bytes(crop_img, image_format="PNG", compress_level=3)
 
     image_writer.write(img_hash256_path, img_bytes)
     return img_hash256_path
@@ -460,7 +460,7 @@ def save_table_fill_image(layout_dets: list[dict], table_fill_image_list: list[d
                 # 新版本生成平铺路径
                 img_hash256_path = f"{str_sha256(img_path)}.png"
                 # img_hash256_path = f'{img_path}.png'
-                img_bytes = image_to_bytes(pil_image, image_format="PNG")
+                img_bytes = image_to_bytes(pil_image, image_format="PNG", compress_level=3)
                 image_writer.write(img_hash256_path, img_bytes)
 
                 image_dir = str(os.path.basename(image_writer._parent_dir))

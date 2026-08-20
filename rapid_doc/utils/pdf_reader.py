@@ -39,9 +39,15 @@ def image_to_bytes(
     image: Image.Image,
     image_format: str = "PNG",  # 也可以用 "JPEG"
     # image_format: str = "JPEG",
+    compress_level: int | None = None,
 ) -> bytes:
+    # compress_level 仅对 PNG 有效；默认 None 保持 PIL 原行为（level 6）。
+    # 显式降低到 3 可显著加快编码，体积损失很小。
     with BytesIO() as image_buffer:
-        image.save(image_buffer, format=image_format)
+        if compress_level is None or image_format.upper() != "PNG":
+            image.save(image_buffer, format=image_format)
+        else:
+            image.save(image_buffer, format=image_format, compress_level=compress_level)
         return image_buffer.getvalue()
 
 

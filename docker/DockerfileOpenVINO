@@ -48,10 +48,11 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages \
     rm -rf /app/wheels && python3 -m pip cache purge
 
 # Install the patched rapid-doc wheel + onnxruntime
-COPY --from=builder /src/dist/rapid_doc-0.9.9-py3-none-any.whl /app/wheels/
+COPY --from=builder /src/dist/rapid_doc-0.9.11-py3-none-any.whl /app/wheels/
 RUN python3 -m pip install --no-cache-dir --break-system-packages \
-        "/app/wheels/rapid_doc-0.9.9-py3-none-any.whl[api]" \
-        "onnxruntime>=1.18.0" && \
+        --ignore-installed typing-extensions \
+        "/app/wheels/rapid_doc-0.9.11-py3-none-any.whl[api]" \
+        "onnxruntime==1.24.4" && \
     rm -rf /app/wheels && python3 -m pip cache purge
 
 # Copy scripts and download models

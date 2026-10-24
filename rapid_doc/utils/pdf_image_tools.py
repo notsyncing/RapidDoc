@@ -266,11 +266,74 @@ def load_images_from_pdf_core(
     return images_list
 
 
+def _bbox_area(bbox):
+    return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+
+
+def _bbox_intersection(a, b):
+    w = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    h = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    return w * h
+
+
+def _bbox_contains(outer, inner):
+    return (outer[0] <= inner[0] and outer[1] <= inner[1]
+            and outer[2] >= inner[2] and outer[3] >= inner[3])
+
+
+def _bbox_union(a, b):
+    return [
+        min(a[0], b[0]), min(a[1], b[1]),
+        max(a[2], b[2]), max(a[3], b[3]),
+    ]
+
+
+def _expand_image_bbox_with_native(bbox, ori_image_list, overlap_thresh=0.5):
+    """把版面模型图片框与同页原生图片框合并。
+
+    - 原生图片区域包含模型框：直接用原生框（#1、股权图等）。
+    - 原生框更宽且覆盖模型框主体：用原生框，避免把模型框上方的图标题带进来
+      （#15/#16/#20 这类“标题 + 流程图”的裁剪）。
+    - 其余情况取并集，补回模型框漏掉的右侧内容。
+    """
+    natives = []
+    for ori_image in ori_image_list or []:
+        native = ori_image.get("bbox")
+        if not native:
+            continue
+        inter = _bbox_intersection(bbox, native)
+        if inter <= 0:
+            continue
+        denom = min(_bbox_area(bbox), _bbox_area(native))
+        if denom > 0 and inter / denom >= overlap_thresh:
+            natives.append(native)
+    if not natives:
+        return list(bbox)
+
+    native_union = list(natives[0])
+    for native in natives[1:]:
+        native_union = _bbox_union(native_union, native)
+
+    if _bbox_contains(native_union, bbox):
+        return native_union
+
+    inter = _bbox_intersection(bbox, native_union)
+    denom = min(_bbox_area(bbox), _bbox_area(native_union))
+    native_width = native_union[2] - native_union[0]
+    model_width = bbox[2] - bbox[0]
+    if denom > 0 and inter / denom >= overlap_thresh and native_width >= model_width:
+        return native_union
+
+    return _bbox_union(bbox, native_union)
+
+
 def cut_image(span, ori_image_list, extract_original_image, extract_original_image_iou_thresh, page_num: int, page_pil_img, return_path, image_writer: FileBasedDataWriter, scale=2):
     """从第page_num页的page中，根据bbox进行裁剪出一张png图片，返回图片路径 save_path：需要同时支持s3和本地,
     图片存放在save_path下，文件名是:
     {page_num}_{bbox[0]}_{bbox[1]}_{bbox[2]}_{bbox[3]}.png , bbox内数字取整。"""
     bbox = span['bbox']
+    if span['type'] in [ContentType.IMAGE]:
+        bbox = _expand_image_bbox_with_native(bbox, ori_image_list)
     crop_img = None
     if extract_original_image and span['type'] in [ContentType.IMAGE]:
         # 判断是否可以提取原始图片
@@ -387,7 +450,10 @@ def get_ori_image(
         try:
             with PyPDFium2Parser.lock:
                 # PDF页面坐标系 左下角原点坐标 (x1, y1, x2, y2)
-                x1, y1, x2, y2 = image.get_pos()
+                try:
+                    x1, y1, x2, y2 = image.get_bounds()
+                except AttributeError:
+                    x1, y1, x2, y2 = image.get_pos()
                 page_width, page_height = page.get_size()
 
                 width = abs(x2 - x1)

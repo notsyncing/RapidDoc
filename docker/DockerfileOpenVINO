@@ -41,11 +41,15 @@ ENV PIP_INDEX_URL=https://pypi.org/simple
 ENV PIP_DEFAULT_TIMEOUT=300
 ENV PIP_RETRIES=10
 
-# Install custom OpenVINO wheel
+# Install custom OpenVINO wheel (stored as <100 MB volumes for GitHub)
 COPY docker/wheels/ /app/wheels/
-RUN python3 -m pip install --no-cache-dir --break-system-packages \
-        /app/wheels/openvino-2026.3.0-22438-cp314-cp314-manylinux_2_43_x86_64.whl && \
-    rm -rf /app/wheels && python3 -m pip cache purge
+RUN cd /app/wheels && \
+    cat openvino-2026.4.1-22989-cp314-cp314-manylinux_2_43_x86_64.whl.part* > \
+        openvino-2026.4.1-22989-cp314-cp314-manylinux_2_43_x86_64.whl && \
+    sha256sum -c openvino-2026.4.1-22989-cp314-cp314-manylinux_2_43_x86_64.whl.sha256 && \
+    python3 -m pip install --no-cache-dir --break-system-packages \
+        /app/wheels/openvino-2026.4.1-22989-cp314-cp314-manylinux_2_43_x86_64.whl && \
+    cd /app && rm -rf /app/wheels && python3 -m pip cache purge
 
 # Install the patched rapid-doc wheel + onnxruntime
 COPY --from=builder /src/dist/rapid_doc-0.9.11-py3-none-any.whl /app/wheels/

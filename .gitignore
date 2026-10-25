@@ -55,3 +55,6 @@ output*/
 
 **/rapid_*_self/**/models/*
 build/
+
+# Reassembled OpenVINO wheel (tracked as .part* volumes)
+docker/wheels/*.whl

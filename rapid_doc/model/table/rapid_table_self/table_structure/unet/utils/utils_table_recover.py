@@ -674,7 +674,13 @@ def _cell_text(cell_text_map: Dict[int, List[str]], cell_idx: int) -> str:
         for text in cell_text_map.get(cell_idx, [])
         if text and text.strip()
     ]
-    return "<br>".join(text_list)
+    text = "<br>".join(text_list)
+    if re.fullmatch(r"[0-9,，.．+\-−%()/（）]+\|+", text):
+        text = text.rstrip("|")
+    numeric = re.sub(r"<br\s*/?>", "", text)
+    if numeric and re.fullmatch(r"[0-9,，.．+\-−%()/（）]+", numeric):
+        return numeric
+    return text
 
 
 def _cell_has_visible_text(cell_text_map: Dict[int, List[str]], cell_idx: int) -> bool:

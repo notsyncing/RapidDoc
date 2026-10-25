@@ -1,4 +1,5 @@
 # Copyright (c) Opendatalab. All rights reserved.
+import os
 import re
 from copy import deepcopy
 from dataclasses import dataclass
@@ -571,6 +572,35 @@ def _expand_header_count_by_rowspan(rows, header_count: int) -> int:
     return expanded_header_count
 
 
+def _table_blank_ratio(state: TableMergeState) -> float:
+    """Fraction of physical cells without visible content."""
+    cells = state.soup.find_all(["td", "th"])
+    if not cells:
+        return 1.0
+    blank = sum(1 for cell in cells if not _cell_has_semantic_content(cell))
+    return blank / len(cells)
+
+
+def _has_sharp_density_drop(current_state: TableMergeState, previous_state: TableMergeState) -> bool:
+    """Reject continuation pages whose grid is much sparser than the previous page.
+
+    A structurally failed model result often decodes a long unruled table into
+    dozens of mostly empty rows. Appending it to an otherwise dense table
+    corrupts the whole cross-page table, so keep the two tables separate.
+    """
+    if os.getenv("RAPID_DOC_TABLE_DENSITY_GUARD", "1") == "0":
+        return False
+    # Normal financial tables with a few blank cells must still merge across
+    # pages; the ratio conditions below ignore them. A grid that is mostly
+    # empty is rejected regardless of absolute size.
+    current_blank_ratio = _table_blank_ratio(current_state)
+    previous_blank_ratio = _table_blank_ratio(previous_state)
+    return (
+        current_blank_ratio >= 0.5
+        and current_blank_ratio - previous_blank_ratio >= 0.3
+    )
+
+
 def can_merge_by_structure(
     current_state: TableMergeState,
     previous_state: TableMergeState,
@@ -589,6 +619,9 @@ def can_merge_by_structure(
         if table1_width > 0 and table2_width > 0:
             if abs(table1_width - table2_width) / min(table1_width, table2_width) >= 0.1:
                 return False
+
+    if _has_sharp_density_drop(current_state, previous_state):
+        return False
 
     if previous_state.total_cols == current_state.total_cols:
         return True
@@ -674,6 +707,9 @@ def can_merge_tables(current_state: TableMergeState, previous_state: TableMergeS
         return False
 
     if _has_conflicting_table_headers(current_state, previous_state):
+        return False
+
+    if _has_sharp_density_drop(current_state, previous_state):
         return False
 
     if previous_state.total_cols == current_state.total_cols:
@@ -1097,6 +1133,38 @@ def perform_table_merge(
         previous_table_block["blocks"].append(temp_table_footnote)
 
     previous_state.dirty = True
+
+
+def drop_empty_table_blocks(pdf_info):
+    """Remove table blocks that have no semantic cell content.
+
+    Density checks can intentionally leave an empty continuation table as a
+    separate block instead of merging it. Such a block carries no information
+    and would otherwise surface as an empty table in the output.
+    """
+    if os.getenv("RAPID_DOC_DROP_EMPTY_TABLES", "1") == "0":
+        return
+    for page_info in pdf_info:
+        for key in ("para_blocks", "preproc_blocks"):
+            blocks = page_info.get(key) or []
+            kept = []
+            for block in blocks:
+                if block.get("type") != BlockType.TABLE:
+                    kept.append(block)
+                    continue
+                html_code = ""
+                for sub in block.get("blocks", []):
+                    for line in sub.get("lines", []):
+                        for span in line.get("spans", []):
+                            html_code += span.get("html", "") or ""
+                if not html_code.strip():
+                    continue
+                soup = BeautifulSoup(html_code, "html.parser")
+                cells = soup.find_all(["td", "th"])
+                if cells and all(not _cell_has_semantic_content(cell) for cell in cells):
+                    continue
+                kept.append(block)
+            page_info[key] = kept
 
 
 def merge_table(page_info_list):

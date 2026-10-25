@@ -4,6 +4,7 @@
 """
 import copy
 import os
+import re
 from typing import List, Dict, Tuple
 from collections import defaultdict
 from functools import lru_cache
@@ -383,9 +384,10 @@ def _run_ocr_rec_postprocess(images_layout_res: List[List[Dict]], ocr_config):
         _orig_n = len(img_crop_list)
         ocr_res_list = []
         if "gpu" in device.lower() or "openvino" in device.lower():
-            max_h = max(img.shape[0] for img in img_crop_list)
-            max_w = max(img.shape[1] for img in img_crop_list)
-            # GPU batch: 固定大小 power-of-2 → 所有 batch 同 shape → 只 JIT 一次
+            # RapidOCR already resizes each crop to its 48-pixel recognition
+            # height and pads internally. Padding raw crops to the global
+            # max height here shrinks short text lines and changes CTC input,
+            # producing wrong characters; keep the batch but use raw crops.
             rec_batch_override = get_env_batch_size('RAPID_DOC_OCR_REC_BATCH_SIZE')
             GPU_BATCH = 128 if rec_batch_override is None else rec_batch_override
             rec_model = ocr_model.ocr_engine.text_rec
@@ -394,21 +396,10 @@ def _run_ocr_rec_postprocess(images_layout_res: List[List[Dict]], ocr_config):
             if rec_batch_override is not None and hasattr(rec_model, 'rec_batch_num'):
                 rec_model.rec_batch_num = min(GPU_BATCH, _orig_n)
 
-            # 按批 pad + 推理：避免全量 crop 的 pad 副本驻留系统内存
-            # （大文档下可达数 GB），每批推理完立即处理并释放。
             for start in range(0, _orig_n, GPU_BATCH):
                 batch = img_crop_list[start:start + GPU_BATCH]
-                batch_padded = []
-                for img in batch:
-                    h, w = img.shape[:2]
-                    if h < max_h or w < max_w:
-                        padded = np.ones((max_h, max_w, 3), dtype=np.uint8) * 255
-                        padded[:h, :w] = img
-                        batch_padded.append(padded)
-                    else:
-                        batch_padded.append(img)
                 try:
-                    batch_res = ocr_model.ocr(batch_padded, det=False, tqdm_enable=True)[0]
+                    batch_res = ocr_model.ocr(batch, det=False, tqdm_enable=True)[0]
                 except Exception as exc:
                     logger.warning(f'OCR-rec batch failed, retry one by one: {exc}')
                     batch_res = []
@@ -498,6 +489,63 @@ def _detect_table_text(
     return restored.tolist()
 
 
+def _table_html_blank_ratio(html_code: str) -> float:
+    """Fraction of physical cells with no visible text."""
+    if not html_code:
+        return 1.0
+    cells = re.findall(r"<(?:td|th)\b[^>]*>(.*?)</(?:td|th)>", html_code, flags=re.S | re.I)
+    if not cells:
+        return 1.0
+    blank = sum(
+        1 for cell in cells
+        if not re.sub(r"<[^>]+>|&nbsp;|\s", "", cell)
+    )
+    return blank / len(cells)
+
+
+def _count_uncovered_text_boxes(det_res, ocr_result, min_overlap: float = 0.3):
+    """Count detected text boxes that native PDF text extraction did not cover.
+
+    Native extraction can miss low-contrast text (for example gray signature
+    titles that are still visible in the table crop). When a material share of
+    detected boxes has no native text, OCR recognition is more complete.
+    """
+    if not det_res:
+        return 0, 0
+    native_boxes = []
+    if ocr_result and len(ocr_result) > 0:
+        for item in ocr_result[0]:
+            pts = np.asarray(item, dtype=np.float32).reshape(-1, 2)
+            if pts.size == 0:
+                continue
+            native_boxes.append((
+                float(pts[:, 0].min()), float(pts[:, 1].min()),
+                float(pts[:, 0].max()), float(pts[:, 1].max()),
+            ))
+    missing = 0
+    for box in det_res:
+        pts = np.asarray(box, dtype=np.float32).reshape(-1, 2)
+        if pts.size == 0:
+            continue
+        x0, y0 = float(pts[:, 0].min()), float(pts[:, 1].min())
+        x1, y1 = float(pts[:, 0].max()), float(pts[:, 1].max())
+        area = max(1.0, (x1 - x0) * (y1 - y0))
+        covered = False
+        for nx0, ny0, nx1, ny1 in native_boxes:
+            iw = max(0.0, min(x1, nx1) - max(x0, nx0))
+            ih = max(0.0, min(y1, ny1) - max(y0, ny0))
+            if iw * ih / area >= min_overlap:
+                covered = True
+                break
+            cx, cy = (nx0 + nx1) / 2, (ny0 + ny1) / 2
+            if x0 <= cx <= x1 and y0 <= cy <= y1:
+                covered = True
+                break
+        if not covered:
+            missing += 1
+    return missing, len(det_res)
+
+
 def _prepare_table_data(
         table_res_dict: Dict,
         page_dict: Dict,
@@ -554,11 +602,17 @@ def _prepare_table_data(
                 native_result = recover_docvortex_table(page_dict, table_bbox)
                 if (native_result is not None and native_result.html.strip()
                         and native_result.confidence >= rule_table_score_threshold):
-                    table_res_dict['table_res'].pop('layout_image_list', None)
-                    table_res_dict['table_res']['html'] = native_result.html
-                    table_res_dict['table_res']['rule_table_score'] = native_result.confidence
-                    table_res_dict['table_res']['table_parse_method'] = 'docvortex_native'
-                    return
+                    blank_ratio = _table_html_blank_ratio(native_result.html)
+                    if blank_ratio <= 0.45:
+                        table_res_dict['table_res'].pop('layout_image_list', None)
+                        table_res_dict['table_res']['html'] = native_result.html
+                        table_res_dict['table_res']['rule_table_score'] = native_result.confidence
+                        table_res_dict['table_res']['table_parse_method'] = 'docvortex_native'
+                        return
+                    logger.info(
+                        'DocVortex native table too sparse (%.2f), fallback to model',
+                        blank_ratio,
+                    )
             except ImportError:
                 raise
             except Exception as exc:
@@ -602,11 +656,17 @@ def _prepare_table_data(
                         or build_track_table(page_dict, table_bbox)
                     )
                     if rule_result and rule_result.score >= rule_table_score_threshold:
-                        table_res_dict['table_res'].pop('layout_image_list', None)
-                        table_res_dict['table_res']['html'] = rule_result.html
-                        table_res_dict['table_res']['rule_table_score'] = rule_result.score
-                        table_res_dict['table_res']['table_parse_method'] = 'pdfium_rule'
-                        return None  # rule-based success
+                        blank_ratio = _table_html_blank_ratio(rule_result.html)
+                        if blank_ratio <= 0.45:
+                            table_res_dict['table_res'].pop('layout_image_list', None)
+                            table_res_dict['table_res']['html'] = rule_result.html
+                            table_res_dict['table_res']['rule_table_score'] = rule_result.score
+                            table_res_dict['table_res']['table_parse_method'] = 'pdfium_rule'
+                            return None  # rule-based success
+                        logger.info(
+                            'PDFium rule table too sparse (%.2f), fallback to model',
+                            blank_ratio,
+                        )
         except Exception as exc:
             logger.warning(f'PDFium rule table failed, fallback to model: {exc}')
 
@@ -677,6 +737,14 @@ def _prepare_table_data(
             table_res_dict, page_dict, scale, det_res, useful_list, table_use_word_box
         )
 
+    if ocr_result and det_res:
+        missing, total = _count_uncovered_text_boxes(det_res, ocr_result)
+        if missing and missing / max(1, total) >= 0.25:
+            logger.info(
+                f'table native text incomplete ({missing}/{total} detected boxes '
+                f'uncovered), fallback to OCR recognition'
+            )
+            ocr_result = []
     needs_rec = not ocr_result and det_res
     if skip_table_rec and needs_rec:
         ocr_result = []
@@ -732,6 +800,7 @@ def _parse_table_config(table_config):
 def _run_batched_table_inference(table_config, batch_data: List[tuple]):
     """对一批预处理后的表格执行分组 batch 推理。"""
     from ...model.table.rapid_table_self import ModelType
+    from ...model.table.utils import select_best_table_model
 
     if not batch_data:
         return
@@ -739,14 +808,85 @@ def _run_batched_table_inference(table_config, batch_data: List[tuple]):
     model_type = table_config.get("model_type", "UNET_SLANET_PLUS")
     is_combined = str(model_type) in ["UNET_SLANET_PLUS", "UNET_SLANET1M", "UNET_UNITABLE"]
 
-    # Collect per-table result holders while grouping
+    def _batch_htmls(entries, attr_name):
+        if not entries:
+            return []
+        model = getattr(entries[0][1], attr_name, None)
+        if model is None:
+            return [e[1].predict(**e[2]) for e in entries]
+        # RapidTable receives raw ndarrays without color conversion, while
+        # the single-table path (RapidTableModel.predict) converts RGB to
+        # BGR. The pipeline stores table crops as RGB, so batch inference
+        # must apply the same conversion or SLANET decodes a wrong grid
+        # (e.g. blank leading cells on long financial tables).
+        imgs = []
+        for e in entries:
+            img = np.asarray(e[2]['image'])
+            if img.ndim == 3 and img.shape[2] == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            imgs.append(img)
+        ocrs = [e[2]['ocr_result'] for e in entries]
+        bs = min(len(imgs), get_env_batch_size('RAPID_DOC_TABLE_STRUCTURE_BATCH_SIZE', 16))
+        try:
+            return model(imgs, ocrs, batch_size=bs).pred_htmls
+        except Exception:
+            return [e[1].predict(**e[2]) for e in entries]
+
+    # SLANET and UNET are both batch-safe. Run both models for normal tables
+    # and pick the denser result; this avoids trusting a wrong wired/wireless
+    # classifier while still using high-batch table-structure inference.
+    if str(model_type) == "UNET_SLANET_PLUS" and os.getenv("RAPID_DOC_TABLE_SINGLE_MODEL") != "1":
+        batch_entries, special_entries = [], []
+        for entry in batch_data:
+            pk = entry[2]
+            if pk.get('fill_image_res') or pk.get('mfd_res'):
+                special_entries.append(entry)
+            else:
+                batch_entries.append(entry)
+
+        if os.getenv("RAPID_DOC_TABLE_PER_TABLE") == "1":
+            for entry in batch_entries:
+                html_code = entry[1].predict(**entry[2])
+                normalized = normalize_table_html_cell_text(html_code) if html_code else None
+                if not _write_table_result(entry[0], normalized):
+                    _fallback_table_to_text(entry[0], entry[2])
+            for entry in special_entries:
+                html_code = entry[1].predict(**entry[2])
+                if not _write_table_result(entry[0], html_code):
+                    _fallback_table_to_text(entry[0], entry[2])
+            return
+        wired_htmls = _batch_htmls(batch_entries, 'wired_table_model')
+        wireless_htmls = _batch_htmls(batch_entries, 'wireless_table_model')
+        for entry, wired, wireless in zip(batch_entries, wired_htmls, wireless_htmls):
+            ocr_result = entry[2].get('ocr_result') or [[], [], []]
+            html_code = select_best_table_model(ocr_result, wired, wireless)
+            if html_code and _table_html_blank_ratio(html_code) > 0.4:
+                # A batched result can still be the wrong model for very long
+                # scanned tables. Re-run both models on just this table and pick
+                # the denser grid.
+                try:
+                    img = entry[2]['image']
+                    ocr = entry[2].get('ocr_result') or []
+                    w_single = entry[1].wired_table_model([img], [ocr]).pred_htmls[0]
+                    l_single = entry[1].wireless_table_model([img], [ocr]).pred_htmls[0]
+                    html_code = select_best_table_model(ocr or [[], [], []], w_single, l_single)
+                except Exception:
+                    pass
+            normalized = normalize_table_html_cell_text(html_code) if html_code else None
+            if not _write_table_result(entry[0], normalized):
+                _fallback_table_to_text(entry[0], entry[2])
+
+        for entry in special_entries:
+            html_code = entry[1].predict(**entry[2])
+            if not _write_table_result(entry[0], html_code):
+                _fallback_table_to_text(entry[0], entry[2])
+        return
+
+    # Other combined models (UNITABLE) and single-model configurations keep
+    # their existing class-based batching path.
     wired_entries, wireless_entries = [], []
     for entry in batch_data:
         table_res_dict, table_model, pk = entry
-        # predict() injects fill-image placeholders and formula latex into the
-        # OCR payload, and compares wired/wireless output when the classifier
-        # confidence is low. Keep those tables on the per-table path: batch
-        # inference would otherwise select one model blindly and lose cells.
         needs_compare = (
             getattr(table_model, "use_compare_table", False)
             or pk.get("table_class_score", 1.0)
@@ -766,7 +906,6 @@ def _run_batched_table_inference(table_config, batch_data: List[tuple]):
         elif pk.get('table_class') == "wireless":
             wireless_entries.append(entry)
         else:
-            # Unclassified → run individually
             html_code = table_model.predict(**pk)
             if not _write_table_result(table_res_dict, html_code):
                 _fallback_table_to_text(table_res_dict, pk)
@@ -774,24 +913,8 @@ def _run_batched_table_inference(table_config, batch_data: List[tuple]):
     def _batch_group(entries, attr_name):
         if not entries:
             return
-        imgs = [e[2]['image'] for e in entries]
-        ocrs = [e[2]['ocr_result'] for e in entries]
-        model = getattr(entries[0][1], attr_name, None)
-        if model is None:
-            for e in entries:
-                html_code = e[1].predict(**e[2])
-                if not _write_table_result(e[0], html_code):
-                    _fallback_table_to_text(e[0], e[2])
-            return
-        bs = min(len(imgs), get_env_batch_size('RAPID_DOC_TABLE_STRUCTURE_BATCH_SIZE', 16))
-        try:
-            batch_htmls = model(imgs, ocrs, batch_size=bs).pred_htmls
-        except Exception:
-            for e in entries:
-                html_code = e[1].predict(**e[2])
-                _write_table_result(e[0], html_code)
-            return
-        for entry, html_code in zip(entries, batch_htmls):
+        htmls = _batch_htmls(entries, attr_name)
+        for entry, html_code in zip(entries, htmls):
             normalized = normalize_table_html_cell_text(html_code) if html_code else None
             if not _write_table_result(entry[0], normalized):
                 _fallback_table_to_text(entry[0], entry[2])
@@ -914,20 +1037,6 @@ def _run_table_ocr(
         })
 
     cropped_img_list = [item["cropped_img"] for item in rec_img_list]
-
-    # 统一尺寸消除 GPU shape 重编译
-    max_h = max(img.shape[0] for img in cropped_img_list)
-    max_w = max(img.shape[1] for img in cropped_img_list)
-    uniform_list = []
-    for img in cropped_img_list:
-        h, w = img.shape[:2]
-        if h < max_h or w < max_w:
-            padded = np.ones((max_h, max_w, 3), dtype=np.uint8) * 255
-            padded[:h, :w] = img
-            uniform_list.append(padded)
-        else:
-            uniform_list.append(img)
-    cropped_img_list = uniform_list
     # GPU batch: 固定大小 power-of-2，余数 padd → 所有 batch 同 shape → 一次 JIT
     rec_model = getattr(getattr(ocr_model, 'ocr_engine', None), 'text_rec', None)
     _tbl_n = len(cropped_img_list)

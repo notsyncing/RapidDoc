@@ -17,6 +17,7 @@ except ImportError:
 from ..model_processor.main import ModelProcessor
 from ..utils.logger import Logger
 from .base import InferSession
+from rapid_doc.utils.openvino_core import get_openvino_core
 
 
 _COMPILED_MODELS: Dict[str, Any] = {}
@@ -37,16 +38,18 @@ class OpenVINOInferSession(InferSession):
 
         device = cfg.get('engine_cfg', {}).get('device', 'CPU')
         ov_config = self._init_config(cfg)
+        self.device = device
+        self.ov_config = ov_config
 
         cache_key = f"{model_path}:{device}"
+        self.core = get_openvino_core()
         if cache_key in _COMPILED_MODELS:
             self.model, self.compiled_model, self.input_tensor, self.output_tensors = _COMPILED_MODELS[cache_key]
         else:
-            core = Core()
-            self.model = core.read_model(model=str(model_path))
+            self.model = self.core.read_model(model=str(model_path))
             self.input_tensor = self.model.inputs[0]
             self.output_tensors = self.model.outputs
-            self.compiled_model = core.compile_model(self.model, device, ov_config)
+            self.compiled_model = self.core.compile_model(self.model, device, ov_config)
             _COMPILED_MODELS[cache_key] = (self.model, self.compiled_model, self.input_tensor, self.output_tensors)
         self.infer_request = self.compiled_model.create_infer_request()
 
@@ -90,6 +93,8 @@ class OpenVINOInferSession(InferSession):
 
         device = cfg.get('engine_cfg', {}).get('device', 'CPU')
         if device.upper() == 'GPU':
+            # Table models stay on the plugin default precision. Forcing f32
+            # here triggers stack corruption on some Intel GPU builds.
             # 允许 GPU 分配超过设备默认单块上限（常见 4GB）的 buffer，
             # 避免大输入触发 "Exceeded max size of memory object allocation"。
             enable_large_allocations = engine_cfg.get("enable_large_allocations", True)

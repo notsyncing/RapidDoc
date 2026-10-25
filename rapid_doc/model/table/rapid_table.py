@@ -1,3 +1,4 @@
+import os
 import cv2
 import numpy as np
 from loguru import logger
@@ -31,7 +32,7 @@ class RapidTableModel(object):
         # Override individual options while preserving the selected device.
         if table_config.get('engine_cfg'):
             engine_cfg.update(table_config['engine_cfg'])
-        self.use_compare_table = table_config.get('use_compare_table') if table_config else False
+        self.use_compare_table = table_config.get('use_compare_table', True) if table_config else True
         self.cls_conf_threshold = table_config.get('cls_conf_threshold', 0.9) if table_config else 0.9
         self.enable_blank_cell_rec = table_config.get('enable_blank_cell_rec', False) if table_config else False
         self.model_type = table_config.get("model_type", ModelType.UNET_SLANET_PLUS)
@@ -39,9 +40,30 @@ class RapidTableModel(object):
 
         # 获取用户传入的 engine_type
         self.engine_type = table_config.get('engine_type') if table_config else None
+
+        # SLANET can run on the same device as the wired table model now that
+        # the repeated-inference issue is fixed in the OpenVINO 2026.4 GPU
+        # plugin. Keep wireless_device as an explicit override.
+        wireless_engine_cfg = dict(engine_cfg)
+        wireless_engine_type = self.engine_type
+        wireless_device = table_config.get('wireless_device')
+        if wireless_device:
+            wireless_engine_cfg['device'] = wireless_device
         # # CPU 上优先使用 OpenVINO（如果可用且用户未指定 engine_type）
         # if device.startswith('cpu') and check_openvino() and not self.engine_type:
         #     self.engine_type = EngineType.OPENVINO
+
+        # UNET's GPU backend can corrupt the OpenVINO GPU context after many
+        # table calls in a long-lived API process. Keep wired UNET on CPU by
+        # default; SLANET/wireless and layout can stay on GPU. Set
+        # RAPID_DOC_UNET_GPU=1 to opt back into GPU UNET.
+        wired_engine_cfg = dict(engine_cfg)
+        if (
+            self.engine_type == EngineType.OPENVINO
+            and "GPU" in str(wired_engine_cfg.get("device", "")).upper()
+            and os.getenv("RAPID_DOC_UNET_GPU") != "1"
+        ):
+            wired_engine_cfg["device"] = "CPU"
 
         if self.model_type == ModelType.UNET_SLANET_PLUS:
             cls_input_args = RapidTableInput(model_type=table_config.get("cls.model_type", ModelType.PADDLE_Q_CLS), engine_type=self.engine_type,
@@ -50,12 +72,12 @@ class RapidTableModel(object):
             self.table_cls = TableCls(cls_input_args)
             wired_input_args = RapidTableInput(model_type=ModelType.UNET, engine_type=self.engine_type,
                                                model_dir_or_path=table_config.get("unet.model_dir_or_path"),
-                                               engine_cfg=engine_cfg, use_ocr=False)
+                                               engine_cfg=wired_engine_cfg, use_ocr=False)
             self.wired_table_model = RapidTable(wired_input_args)
             self._attach_wired_ocr_engine(self.wired_table_model)
-            wireless_input_args = RapidTableInput(model_type=ModelType.SLANETPLUS, engine_type=self.engine_type,
+            wireless_input_args = RapidTableInput(model_type=ModelType.SLANETPLUS, engine_type=wireless_engine_type,
                                                   model_dir_or_path=table_config.get("slanet_plus.model_dir_or_path"),
-                                                  engine_cfg=engine_cfg, use_ocr=False)
+                                                  engine_cfg=wireless_engine_cfg, use_ocr=False)
             self.wireless_table_model = RapidTable(wireless_input_args)
         elif self.model_type == ModelType.UNET_UNITABLE:
             cls_input_args = RapidTableInput(model_type=table_config.get("cls.model_type", ModelType.PADDLE_Q_CLS), engine_type=self.engine_type,
@@ -64,7 +86,7 @@ class RapidTableModel(object):
             self.table_cls = TableCls(cls_input_args)
             wired_input_args = RapidTableInput(model_type=ModelType.UNET, engine_type=self.engine_type,
                                                model_dir_or_path=table_config.get("unet.model_dir_or_path"),
-                                               engine_cfg=engine_cfg, use_ocr=False)
+                                               engine_cfg=wired_engine_cfg, use_ocr=False)
             self.wired_table_model = RapidTable(wired_input_args)
             self._attach_wired_ocr_engine(self.wired_table_model)
             wireless_input_args = RapidTableInput(model_type=ModelType.UNITABLE, engine_type=EngineType.TORCH,
@@ -78,29 +100,47 @@ class RapidTableModel(object):
             self.table_cls = TableCls(cls_input_args)
             wired_input_args = RapidTableInput(model_type=ModelType.UNET, engine_type=self.engine_type,
                                                model_dir_or_path=table_config.get("unet.model_dir_or_path"),
-                                               engine_cfg=engine_cfg, use_ocr=False)
+                                               engine_cfg=wired_engine_cfg, use_ocr=False)
             self.wired_table_model = RapidTable(wired_input_args)
             self._attach_wired_ocr_engine(self.wired_table_model)
-            wireless_input_args = RapidTableInput(model_type=ModelType.SLANET1M, engine_type=self.engine_type,
+            wireless_input_args = RapidTableInput(model_type=ModelType.SLANET1M, engine_type=wireless_engine_type,
                                                   model_dir_or_path=table_config.get("slanet_1m.model_dir_or_path"),
-                                                  engine_cfg=engine_cfg, use_ocr=False)
+                                                  engine_cfg=wireless_engine_cfg, use_ocr=False)
             self.wireless_table_model = RapidTable(wireless_input_args)
         else:
             if self.model_type == ModelType.UNITABLE:
                 self.engine_type = EngineType.TORCH
-            input_args = RapidTableInput(model_type=self.model_type, engine_type=self.engine_type,
+            single_engine_type = self.engine_type
+            single_engine_cfg = engine_cfg
+            if self.model_type in (ModelType.SLANETPLUS, ModelType.SLANET1M):
+                single_engine_type = wireless_engine_type
+                single_engine_cfg = wireless_engine_cfg
+            if self.model_type == ModelType.UNET:
+                single_engine_cfg = wired_engine_cfg
+            input_args = RapidTableInput(model_type=self.model_type, engine_type=single_engine_type,
                                          model_dir_or_path=table_config.get("model_dir_or_path"),
-                                         engine_cfg=engine_cfg, use_ocr=False)
+                                         engine_cfg=single_engine_cfg, use_ocr=False)
             self.table_model = RapidTable(input_args)
             if self.model_type == ModelType.UNET:
                 self._attach_wired_ocr_engine(self.table_model)
 
     def _attach_wired_ocr_engine(self, table_model):
-        if not self.enable_blank_cell_rec:
-            return
         table_structure = getattr(table_model, "table_structure", None)
-        if table_structure is not None and hasattr(table_structure, "ocr_engine"):
+        if table_structure is None:
+            return
+        # The main OCR engine is busy on GPU during table inference. Use a
+        # separate CPU/ONNX OCR instance for rare numeric-cell repairs; reusing
+        # the GPU session here can corrupt the GPU plugin state.
+        if hasattr(table_structure, "refine_ocr_engine"):
+            table_structure.refine_ocr_engine = None
+        if self.enable_blank_cell_rec and hasattr(table_structure, "ocr_engine"):
             table_structure.ocr_engine = self.ocr_engine
+        if os.getenv("RAPID_DOC_TABLE_BLANK_REC") == "1" and hasattr(table_structure, "ocr_engine"):
+            try:
+                from rapid_doc.model.ocr.rapid_ocr import RapidOcrModel
+                table_structure.ocr_engine = RapidOcrModel()
+            except Exception:
+                pass
 
     def rule_table_class(self, image):
         """Return wired/wireless eligibility without running OCR.

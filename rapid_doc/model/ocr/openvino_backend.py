@@ -23,6 +23,7 @@ except ImportError:
 from rapidocr.utils.download_file import DownloadFile, DownloadFileInput
 from rapidocr.utils.log import logger
 from rapidocr.inference_engine.base import FileInfo, InferSession
+from rapid_doc.utils.openvino_core import get_openvino_core
 
 
 _COMPILED_MODELS: Dict[str, Any] = {}
@@ -75,14 +76,14 @@ class OpenVINOInferSession(InferSession):
 
         cache_key = f"{model_path}:{device}"
         if cache_key in _COMPILED_MODELS:
-            self.model, self.compiled_model, self.input_tensor, self.output_tensors = _COMPILED_MODELS[cache_key]
+            self.core, self.model, self.compiled_model, self.input_tensor, self.output_tensors = _COMPILED_MODELS[cache_key]
         else:
-            core = Core()
-            self.model = core.read_model(model=str(model_path))
+            self.core = get_openvino_core()
+            self.model = self.core.read_model(model=str(model_path))
             self.input_tensor = self.model.inputs[0]
             self.output_tensors = self.model.outputs
-            self.compiled_model = core.compile_model(self.model, device, ov_config)
-            _COMPILED_MODELS[cache_key] = (self.model, self.compiled_model, self.input_tensor, self.output_tensors)
+            self.compiled_model = self.core.compile_model(self.model, device, ov_config)
+            _COMPILED_MODELS[cache_key] = (self.core, self.model, self.compiled_model, self.input_tensor, self.output_tensors)
         self.infer_request = self.compiled_model.create_infer_request()
 
     def _init_config(self, cfg: DictConfig) -> Dict[Any, Any]:
@@ -124,12 +125,15 @@ class OpenVINOInferSession(InferSession):
                 config["SCHEDULING_CORE_TYPE"] = str(scheduling_core_type)
 
         device = cfg.get('device', 'CPU')
+        precision = engine_cfg.get("inference_precision") or os.getenv("RAPID_DOC_OCR_PRECISION")
+        if precision:
+            config["INFERENCE_PRECISION_HINT"] = str(precision)
         if device.upper() == 'GPU':
             # 允许 GPU 分配超过设备默认单块上限（GPU_DEVICE_MAX_ALLOC_MEM_SIZE，
             # 常见 4GB）的 buffer，否则大文档下 batch 输入张量会触发
             # "Exceeded max size of memory object allocation"。
             # 默认开启；如需关闭可设 engine_cfg["enable_large_allocations"] = False。
-            enable_large_allocations = engine_cfg.get("enable_large_allocations", True)
+            enable_large_allocations = engine_cfg.get("enable_large_allocations", False)
             config["GPU_ENABLE_LARGE_ALLOCATIONS"] = bool(enable_large_allocations)
 
         self.logger.info(f"Using OpenVINO config: {config}")

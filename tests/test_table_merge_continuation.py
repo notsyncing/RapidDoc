@@ -88,3 +88,56 @@ def test_sparse_first_row_with_key_is_not_inferred_as_continuation():
         '<tr><td>11</td><td>next</td><td>1</td></tr></table>'
     )
     assert _infer_sparse_continuation_cell_merge(previous, current, 0) is None
+
+
+def test_sharp_density_drop_blocks_cross_page_merge():
+    from rapid_doc.utils.table_merge import can_merge_by_structure
+
+    dense_rows = ''.join(
+        f'<tr><td>row{i}</td><td>{i}</td></tr>' for i in range(10)
+    )
+    previous = build_table_state_from_html(
+        f'<table><tr><td>name</td><td>value</td></tr>{dense_rows}</table>'
+    )
+    sparse_rows = ''.join(
+        '<tr><td></td><td></td></tr>' for _ in range(20)
+    )
+    current = build_table_state_from_html(
+        f'<table><tr><td>name</td><td>value</td></tr>'
+        f'<tr><td>row10</td><td>10</td></tr>{sparse_rows}</table>'
+    )
+
+    assert not can_merge_by_structure(current, previous)
+
+
+def test_dense_continuation_still_merges_by_structure():
+    from rapid_doc.utils.table_merge import can_merge_by_structure
+
+    previous = build_table_state_from_html(
+        '<table><tr><td>name</td><td>value</td></tr>'
+        '<tr><td>row0</td><td>0</td></tr></table>'
+    )
+    current = build_table_state_from_html(
+        '<table><tr><td>name</td><td>value</td></tr>'
+        '<tr><td>row1</td><td>1</td></tr></table>'
+    )
+
+    assert can_merge_by_structure(current, previous)
+
+
+def test_sparse_continuation_not_merged_by_pipeline_rule():
+    from rapid_doc.utils.table_merge import can_merge_tables
+
+    previous = build_table_state_from_html(
+        '<table><tr><td>name</td><td>value</td></tr>'
+        '<tr><td>row0</td><td>0</td></tr><tr><td>row1</td><td>1</td></tr></table>'
+    )
+    current = build_table_state_from_html(
+        '<table><tr><td>name</td><td>value</td></tr>'
+        + '<tr><td></td><td></td></tr>' * 20
+        + '</table>'
+    )
+    previous.owner_block = {'blocks': [], 'bbox': [0, 0, 100, 100]}
+    current.owner_block = {'blocks': [], 'bbox': [0, 0, 100, 100]}
+
+    assert not can_merge_tables(current, previous)

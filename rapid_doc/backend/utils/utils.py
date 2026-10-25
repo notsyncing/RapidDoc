@@ -3,7 +3,7 @@ from copy import deepcopy
 
 from loguru import logger
 from typing import List, Tuple, Dict, Optional
-from rapid_doc.utils.table_merge import merge_table
+from rapid_doc.utils.table_merge import drop_empty_table_blocks, merge_table
 from rapid_doc.model.layout.rapid_layout_self.model_handler.pp_doclayout.post_process import calculate_polygon_overlap_ratio, \
     calculate_bbox_area
 from rapid_doc.model.reading_order.utils import calculate_overlap_ratio
@@ -28,6 +28,7 @@ def cross_page_table_merge(pdf_info: list[dict]):
     else:
         logger.warning(f'unknown MINERU_TABLE_MERGE_ENABLE config: {is_merge_table}, pass')
         pass
+    drop_empty_table_blocks(pdf_info)
 
 def remove_layout_in_ori_images(images_layout_res, pdf_dict_list, scale_list):
     """

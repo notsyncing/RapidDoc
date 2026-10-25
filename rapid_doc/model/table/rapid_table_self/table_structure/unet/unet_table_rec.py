@@ -1,4 +1,6 @@
 import logging
+import os
+import re
 import traceback
 import cv2
 import numpy as np
@@ -37,6 +39,9 @@ class UnetTableRecognition:
         self.table_structure = TSRUnetStructurer(self.cfg)
         self.table_recover = TableRecover()
         self.ocr_engine = None
+        # Separate engine for re-reading multi-line numeric cells. Keeping it
+        # apart from ocr_engine avoids enabling blank-cell OCR implicitly.
+        self.refine_ocr_engine = None
 
     def __call__(
         self, ori_imgs: List[np.ndarray], ocr_results,
@@ -93,6 +98,7 @@ class UnetTableRecognition:
                 t_rec_ocr_list = self.transform_res(cell_box_det_map, polygons, logi_points)
                 # 将每个单元格中的ocr识别结果排序和同行合并，输出的html能完整保留文字的换行格式
                 t_rec_ocr_list = self.sort_and_gather_ocr_res(t_rec_ocr_list)
+                t_rec_ocr_list = self.refine_numeric_cells(img, polygons, t_rec_ocr_list)
 
                 cell_box_det_map = {
                     t_box_ocr["cell_idx"]: [
@@ -224,6 +230,99 @@ class UnetTableRecognition:
                 continue
             cell_box_map[i] = [[box, normalize_table_ocr_text(ocr_text), ocr_score]]
         return cell_box_map
+
+    def refine_numeric_cells(self, img, polygons, t_rec_ocr_list):
+        """Re-OCR numeric cells that were split into multiple OCR lines.
+
+        Page-level OCR can append the first digit of the neighbouring cell to
+        a number wrapped across lines (e.g. 75.27 -> 75.271). Re-reading the
+        exact cell crop removes that boundary bleed and also joins the lines.
+        """
+        if os.getenv("RAPID_DOC_DISABLE_NUMERIC_REFINE") == "1":
+            return t_rec_ocr_list
+        if self.refine_ocr_engine is None:
+            try:
+                from rapid_doc.model.ocr.rapid_ocr import RapidOcrModel
+                self.refine_ocr_engine = RapidOcrModel()
+            except Exception as exc:
+                logger.warning(f"Table numeric cell OCR init failed: {exc}")
+                return t_rec_ocr_list
+        # Re-OCR is only a repair path for a handful of wrapped numbers. Very
+        # large grids (scanned financial tables) can contain hundreds of
+        # suspicious cells; re-running detection per cell is both slow and
+        # unstable on the GPU, so leave those tables to the normal matcher.
+        if len(t_rec_ocr_list) > 80:
+            return t_rec_ocr_list
+
+        bgr_img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        crops, entries = [], []
+        for entry in t_rec_ocr_list:
+            items = entry.get("t_ocr_res") or []
+            if not items:
+                continue
+            joined = " ".join(str(item[1]) for item in items if item[1])
+            compact = re.sub(r"<[^>]+>|\s", "", joined)
+            if not compact or not re.fullmatch(r"[0-9,，.．+\-−%()/（）]+", compact):
+                continue
+            if not self._suspicious_numeric(compact):
+                continue
+            poly = np.asarray(polygons[entry["cell_idx"]], dtype=np.float64)
+            x1, y1 = int(poly[:, 0].min()) + 1, int(poly[:, 1].min()) + 1
+            x2, y2 = int(poly[:, 0].max()) - 1, int(poly[:, 1].max()) - 1
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crop = bgr_img[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
+            if crop.size == 0:
+                continue
+            crops.append(crop)
+            entries.append(entry)
+
+        if not crops:
+            return t_rec_ocr_list
+
+        for entry, crop in zip(entries, crops):
+            try:
+                ocr_result = self.refine_ocr_engine.ocr(crop, det=True, rec=True)
+            except Exception as exc:
+                logger.warning(f"Table numeric cell re-OCR failed: {exc}")
+                continue
+
+            lines = ocr_result[0] if ocr_result else None
+            if not lines:
+                continue
+            texts, scores = [], []
+            for line in lines:
+                if not isinstance(line, (list, tuple)) or len(line) < 2:
+                    continue
+                rec = line[1]
+                if isinstance(rec, (list, tuple)) and len(rec) >= 2:
+                    texts.append(rec[0])
+                    scores.append(float(rec[1]))
+            if not texts or any(score < 0.6 for score in scores):
+                continue
+            text = "".join(str(t) for t in texts if t)
+            compact = re.sub(r"<[^>]+>|\s", "", text)
+            if not compact or not re.fullmatch(r"[0-9,，.．+\-−%()/（）]+", compact):
+                continue
+            if self._suspicious_numeric(compact):
+                continue
+            box = entry["t_ocr_res"][0][0]
+            entry["t_ocr_res"] = [[box, normalize_table_ocr_text(text)]]
+        return t_rec_ocr_list
+
+    @staticmethod
+    def _suspicious_numeric(text: str) -> bool:
+        """Return True for numeric text likely poisoned by a cell boundary."""
+        if "." in text:
+            decimals = text.rsplit(".", 1)[1].rstrip("%")
+            if decimals.isdigit() and len(decimals) > 2:
+                return True
+        integer_part = text.split(".", 1)[0]
+        if "," in integer_part:
+            groups = integer_part.split(",")
+            if any(len(group) != 3 for group in groups[1:]):
+                return True
+        return False
 
     @staticmethod
     def _should_drop_blank_cell_rec_result(text: str, score) -> bool:

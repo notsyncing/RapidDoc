@@ -1,4 +1,5 @@
 import html
+import os
 import re
 
 from bs4 import BeautifulSoup, NavigableString
@@ -109,6 +110,35 @@ def select_best_table_model(ocr_result, wired_html_code, wireless_html_code):
     # 计算非空单元格数量
     wireless_non_blank_count = wireless_len - wireless_blank_count
     wired_non_blank_count = wired_len - wired_blank_count
+
+    # A single giant cell is almost always a failed structure decode; prefer
+    # the model that produced a real grid.
+    if os.getenv("RAPID_DOC_TABLE_SINGLE_CELL_PREFERENCE", "1") != "0":
+        if wired_len <= 2 and wireless_len >= 5 and wireless_non_blank_count >= 3:
+            return wireless_html_code
+        if wireless_len <= 2 and wired_len >= 5 and wired_non_blank_count >= 3:
+            return wired_html_code
+
+    # A grid that is mostly empty is almost always a structural failure (long
+    # unruled tables often collapse into dozens of empty columns). Prefer the
+    # model with a materially denser grid even if it has fewer physical cells.
+    if wired_len and wireless_len:
+        wired_blank_ratio = wired_blank_count / wired_len
+        wireless_blank_ratio = wireless_blank_count / wireless_len
+        if (
+            wired_blank_ratio - wireless_blank_ratio >= 0.3
+            and wireless_blank_ratio <= 0.25
+            and wired_blank_ratio >= 0.5
+            and wired_non_blank_count <= wireless_non_blank_count
+        ):
+            return wireless_html_code
+        if (
+            wireless_blank_ratio - wired_blank_ratio >= 0.3
+            and wired_blank_ratio <= 0.25
+            and wireless_blank_ratio >= 0.5
+            and wireless_non_blank_count <= wired_non_blank_count
+        ):
+            return wired_html_code
     if wired_text_count > wireless_text_count and wired_non_blank_count >= wireless_non_blank_count:
         return wired_html_code
     # 无线表非空格数量大于有线表非空格数量时，才考虑切换

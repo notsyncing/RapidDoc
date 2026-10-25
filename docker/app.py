@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import os
 import gc
@@ -32,6 +33,10 @@ app = FastAPI(
     version=__version__
 )
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# RapidDoc's OpenVINO models and the shared GPU Core are not safe to run
+# concurrently. Serialize parsing requests; health checks can still respond.
+_PARSE_LOCK = asyncio.Lock()
 
 @app.get("/health")
 async def health_check():
@@ -264,26 +269,27 @@ async def file_parse(
             actual_lang_list = [actual_lang_list[0] if actual_lang_list else "ch"] * len(pdf_file_names)
 
         # 调用异步处理函数
-        await aio_do_parse(
-                output_dir=unique_dir,
-                pdf_file_names=pdf_file_names,
-                pdf_bytes_list=pdf_bytes_list,
-                p_lang_list=actual_lang_list,
-                backend=backend,
-                parse_method=parse_method,
-                formula_enable=formula_enable,
-                table_enable=table_enable,
-                f_draw_layout_bbox=False,
-                f_draw_span_bbox=False,
-                f_dump_md=return_md,
-                f_dump_middle_json=return_middle_json,
-                f_dump_model_output=return_model_output,
-                f_dump_orig_pdf=False,
-                f_dump_content_list=return_content_list,
-                start_page_id=start_page_id,
-                end_page_id=end_page_id,
-                layout_config = layout_config, ocr_config = ocr_config, formula_config = formula_config,
-                table_config = table_config, checkbox_config = checkbox_config, image_config = image_config,
+        async with _PARSE_LOCK:
+            await aio_do_parse(
+                    output_dir=unique_dir,
+                    pdf_file_names=pdf_file_names,
+                    pdf_bytes_list=pdf_bytes_list,
+                    p_lang_list=actual_lang_list,
+                    backend=backend,
+                    parse_method=parse_method,
+                    formula_enable=formula_enable,
+                    table_enable=table_enable,
+                    f_draw_layout_bbox=False,
+                    f_draw_span_bbox=False,
+                    f_dump_md=return_md,
+                    f_dump_middle_json=return_middle_json,
+                    f_dump_model_output=return_model_output,
+                    f_dump_orig_pdf=False,
+                    f_dump_content_list=return_content_list,
+                    start_page_id=start_page_id,
+                    end_page_id=end_page_id,
+                    layout_config = layout_config, ocr_config = ocr_config, formula_config = formula_config,
+                    table_config = table_config, checkbox_config = checkbox_config, image_config = image_config,
             )
 
         # 根据 response_format_zip 决定返回类型

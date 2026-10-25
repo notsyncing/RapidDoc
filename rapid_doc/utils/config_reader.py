@@ -85,7 +85,8 @@ def get_device():
         openvino_ = import_package("openvino")
         if openvino_ is not None:
             from openvino import Core
-            core = Core()
+            from rapid_doc.utils.openvino_core import get_openvino_core
+            core = get_openvino_core()
             if 'GPU' in core.available_devices:
                 os.environ.setdefault('OMP_NUM_THREADS', '1')
                 os.environ.setdefault('OPENVINO_NUM_THREADS', '1')

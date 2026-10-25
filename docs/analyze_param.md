@@ -30,6 +30,32 @@ os.environ['RAPID_MODELS_DIR'] = r'D:\CodeProjects\doc\RapidAI\models'
 # 是否启用图片方向矫正，开启后，可以自动识别并矫正 90°、270°的图片
 os.environ['USE_DOC_ORIENTATION_CLASSIFY'] = "true" 
 ```
+
+Pipeline 各阶段 batch 大小也可通过环境变量指定。环境变量未设置（或值非法）时沿用原有逻辑；设置后该值为最终 batch 大小，不再乘以按显存自动计算的 `batch_ratio`。
+
+|             环境变量              |      阶段       |        不设置时的默认行为         |
+|:-----------------------------:|:-------------:|:-------------------------:|
+|    RAPID_DOC_PAGE_BATCH_SIZE     |   页面分组 batch   |    384（兼容 MINERU_MIN_BATCH_INFERENCE_SIZE）    |
+|   RAPID_DOC_LAYOUT_BATCH_SIZE    |     版面识别      | layout_config.batch_num * batch_ratio |
+|   RAPID_DOC_FORMULA_BATCH_SIZE   |     公式识别      | formula_config.batch_num * batch_ratio |
+|  RAPID_DOC_OCR_DET_BATCH_SIZE   |    OCR 检测     | Det.rec_batch_num * batch_ratio |
+|  RAPID_DOC_OCR_REC_BATCH_SIZE   |    OCR 识别     | GPU 默认 128；CPU 沿用 Rec.rec_batch_num |
+|  RAPID_DOC_OCR_CLS_BATCH_SIZE   |  OCR 方向分类    | 沿用 Cls.cls_batch_num 或 rapidocr 默认值 |
+| RAPID_DOC_TABLE_CLS_BATCH_SIZE  |     表格分类      |            32             |
+| RAPID_DOC_TABLE_REC_BATCH_SIZE  |   表格文字识别     |            128            |
+| RAPID_DOC_TABLE_STRUCTURE_BATCH_SIZE |   表格结构识别    |            16             |
+
+```bash
+os.environ['RAPID_DOC_PAGE_BATCH_SIZE'] = "384"
+os.environ['RAPID_DOC_LAYOUT_BATCH_SIZE'] = "1"
+os.environ['RAPID_DOC_FORMULA_BATCH_SIZE'] = "1"
+os.environ['RAPID_DOC_OCR_DET_BATCH_SIZE'] = "32"
+os.environ['RAPID_DOC_OCR_REC_BATCH_SIZE'] = "128"
+os.environ['RAPID_DOC_OCR_CLS_BATCH_SIZE'] = "32"
+os.environ['RAPID_DOC_TABLE_CLS_BATCH_SIZE'] = "32"
+os.environ['RAPID_DOC_TABLE_REC_BATCH_SIZE'] = "128"
+os.environ['RAPID_DOC_TABLE_STRUCTURE_BATCH_SIZE'] = "16"
+```
 #### 1、使用gpu推理
 ```bash
 # 新环境直接选择 GPU extra，不会自动安装 CPU 版 Runtime

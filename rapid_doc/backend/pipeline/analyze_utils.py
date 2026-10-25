@@ -21,6 +21,7 @@ from ...model.docvortex_adapter import recover_docvortex_table, use_docvortex_ta
 from ...model.table.utils import normalize_table_html_cell_text
 from ...utils.bbox_utils import normalize_to_int_bbox
 from ...utils.boxbase import rotate_table_image
+from ...utils.config_reader import get_env_batch_size
 from ...utils.enum_class import CategoryId
 from ...utils.model_utils import crop_img
 from ...utils.ocr_utils import (
@@ -188,7 +189,9 @@ def _run_ocr_det_batch(
     """批量 OCR 检测"""
     # OCR 配置
     use_det_mode = ocr_config.get("use_det_mode", "auto")
-    ocr_det_base_batch_size = ocr_config.get("Det.rec_batch_num", 1)
+    ocr_det_base_batch_size = get_env_batch_size(
+        'RAPID_DOC_OCR_DET_BATCH_SIZE', ocr_config.get("Det.rec_batch_num", 1)
+    )
 
     # 按语言直接分组，避免额外的全局列表持有 bgr_image 引用，
     # 大文档下全量 crop 可达数 GB，处理完一批即释放。
@@ -383,14 +386,16 @@ def _run_ocr_rec_postprocess(images_layout_res: List[List[Dict]], ocr_config):
             max_h = max(img.shape[0] for img in img_crop_list)
             max_w = max(img.shape[1] for img in img_crop_list)
             # GPU batch: 固定大小 power-of-2 → 所有 batch 同 shape → 只 JIT 一次
-            GPU_BATCH = 128
+            rec_batch_override = get_env_batch_size('RAPID_DOC_OCR_REC_BATCH_SIZE')
+            GPU_BATCH = 128 if rec_batch_override is None else rec_batch_override
             rec_model = ocr_model.ocr_engine.text_rec
             if hasattr(rec_model, 'cfg') and hasattr(rec_model.cfg, 'rec_batch_num'):
                 rec_model.cfg.rec_batch_num = min(GPU_BATCH, _orig_n)
+            if rec_batch_override is not None and hasattr(rec_model, 'rec_batch_num'):
+                rec_model.rec_batch_num = min(GPU_BATCH, _orig_n)
 
             # 按批 pad + 推理：避免全量 crop 的 pad 副本驻留系统内存
-            # （大文档下可达数 GB），每批推理完立即释放。
-            GPU_BATCH = 128
+            # （大文档下可达数 GB），每批推理完立即处理并释放。
             for start in range(0, _orig_n, GPU_BATCH):
                 batch = img_crop_list[start:start + GPU_BATCH]
                 batch_padded = []
@@ -778,7 +783,7 @@ def _run_batched_table_inference(table_config, batch_data: List[tuple]):
                 if not _write_table_result(e[0], html_code):
                     _fallback_table_to_text(e[0], e[2])
             return
-        bs = min(len(imgs), 16)
+        bs = min(len(imgs), get_env_batch_size('RAPID_DOC_TABLE_STRUCTURE_BATCH_SIZE', 16))
         try:
             batch_htmls = model(imgs, ocrs, batch_size=bs).pred_htmls
         except Exception:
@@ -927,7 +932,8 @@ def _run_table_ocr(
     rec_model = getattr(getattr(ocr_model, 'ocr_engine', None), 'text_rec', None)
     _tbl_n = len(cropped_img_list)
     if rec_model is not None and hasattr(rec_model, 'cfg') and hasattr(rec_model.cfg, 'rec_batch_num'):
-        GPU_BATCH = 128
+        rec_batch_override = get_env_batch_size('RAPID_DOC_TABLE_REC_BATCH_SIZE')
+        GPU_BATCH = 128 if rec_batch_override is None else rec_batch_override
         if _tbl_n > GPU_BATCH:
             pad = (GPU_BATCH - _tbl_n % GPU_BATCH) % GPU_BATCH
             if pad:
@@ -936,6 +942,8 @@ def _run_table_ocr(
             rec_model.cfg.rec_batch_num = GPU_BATCH
         else:
             rec_model.cfg.rec_batch_num = _tbl_n
+        if rec_batch_override is not None and hasattr(rec_model, 'rec_batch_num'):
+            rec_model.rec_batch_num = min(GPU_BATCH, _tbl_n)
 
     ocr_res_list = None
     try:

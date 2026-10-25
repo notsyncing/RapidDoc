@@ -10,7 +10,7 @@ from rapid_doc.backend.utils.html_image_utils import replace_inline_base64_img_s
 from rapid_doc.backend.utils.utils import cross_page_table_merge
 from rapid_doc.model.custom import CustomBaseModel
 from rapid_doc.utils.char_utils import full_to_half
-from rapid_doc.utils.config_reader import get_device, get_formula_enable
+from rapid_doc.utils.config_reader import get_device, get_env_batch_size, get_formula_enable
 from rapid_doc.backend.pipeline.model_init import AtomModelSingleton
 from rapid_doc.backend.pipeline.para_split import para_split
 from rapid_doc.utils.block_pre_proc import prepare_block_bboxes, process_groups
@@ -476,7 +476,14 @@ def _post_process_ocr(middle_json, lang, ocr_config):
         )
 
         # Chunk large batches to avoid GPU OOM on small VRAM
-        GPU_OCR_CHUNK = 128
+        rec_batch_override = get_env_batch_size('RAPID_DOC_OCR_REC_BATCH_SIZE')
+        GPU_OCR_CHUNK = 128 if rec_batch_override is None else rec_batch_override
+        if rec_batch_override is not None and hasattr(ocr_model, 'text_recognizer'):
+            recognizer = ocr_model.text_recognizer
+            if hasattr(recognizer, 'cfg') and hasattr(recognizer.cfg, 'rec_batch_num'):
+                recognizer.cfg.rec_batch_num = rec_batch_override
+            if hasattr(recognizer, 'rec_batch_num'):
+                recognizer.rec_batch_num = rec_batch_override
         ocr_res_list = []
         for start_i in range(0, len(img_crop_list), GPU_OCR_CHUNK):
             chunk = img_crop_list[start_i:start_i + GPU_OCR_CHUNK]

@@ -132,6 +132,28 @@ def get_latex_delimiter_config():
     else:
         return latex_delimiter_config
 
+def get_env_batch_size(env_name: str, default: int | None = None) -> int | None:
+    """读取环境变量中的 batch 大小。
+
+    未设置或为空时返回 ``default``；非法值（非整数或小于 1）会记录警告并
+    返回 ``default``，保证未显式配置时沿用调用方的原有逻辑。
+    """
+    value = os.getenv(env_name)
+    if value is None or not value.strip():
+        return default
+    try:
+        batch_size = int(value)
+    except ValueError:
+        logger.warning(f"Invalid {env_name} value: {value}, use default {default}")
+        return default
+    if batch_size < 1:
+        logger.warning(
+            f"Invalid {env_name} value: {value}, must be >= 1, use default {default}"
+        )
+        return default
+    return batch_size
+
+
 def get_processing_window_size(default: int = 64) -> int:
     value = os.getenv('MINERU_PROCESSING_WINDOW_SIZE')
     if value is None:

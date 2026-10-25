@@ -22,7 +22,7 @@ from ...utils.bbox_utils import normalize_to_int_bbox
 from ...utils.boxbase import get_rotate_image, restore_poly
 from ...utils.ocr_utils import get_rotate_crop_image
 from ...utils.checkbox_det_cls import checkbox_predict
-from ...utils.config_reader import get_formula_enable, get_table_enable
+from ...utils.config_reader import get_formula_enable, get_table_enable, get_env_batch_size
 from ...utils.enum_class import CategoryId
 from ...utils.model_utils import crop_img, get_res_list_from_layout_res, clean_vram
 from ...utils.pdf_image_tools import get_crop_np_img
@@ -61,24 +61,40 @@ class BatchAnalyze:
         # OCR 配置
         self.use_det_mode = self.ocr_config.get("use_det_mode", "auto")
         base_ocr = self.ocr_config.get("Det.rec_batch_num", 1)
-        self.ocr_det_base_batch_size = base_ocr * self.batch_ratio
-        # 写回 config 使 _run_ocr_det_batch 等函数读到放大后的值
-        if self.batch_ratio > 1:
-            self.ocr_config["Det.rec_batch_num"] = self.ocr_det_base_batch_size
+        det_batch_size = get_env_batch_size('RAPID_DOC_OCR_DET_BATCH_SIZE')
+        if det_batch_size is not None:
+            self.ocr_det_base_batch_size = det_batch_size
+            self.ocr_config["Det.rec_batch_num"] = det_batch_size
+        else:
+            self.ocr_det_base_batch_size = base_ocr * self.batch_ratio
+            # 写回 config 使 _run_ocr_det_batch 等函数读到放大后的值
+            if self.batch_ratio > 1:
+                self.ocr_config["Det.rec_batch_num"] = self.ocr_det_base_batch_size
+        rec_batch_size = get_env_batch_size('RAPID_DOC_OCR_REC_BATCH_SIZE')
+        if rec_batch_size is not None:
+            self.ocr_config["Rec.rec_batch_num"] = rec_batch_size
+        elif self.batch_ratio > 1:
             base_rec = self.ocr_config.get("Rec.rec_batch_num", 1)
             self.ocr_config["Rec.rec_batch_num"] = base_rec * self.batch_ratio
+        cls_batch_size = get_env_batch_size('RAPID_DOC_OCR_CLS_BATCH_SIZE')
+        if cls_batch_size is not None:
+            self.ocr_config["Cls.cls_batch_num"] = cls_batch_size
         self.seal_enable = self.ocr_config.get("seal_enable", True)
         self.use_custom_ocr = False
         
         # 版面配置
         base_layout = self.layout_config.get("batch_num", 1)
-        self.layout_base_batch_size = base_layout * self.batch_ratio
+        self.layout_base_batch_size = get_env_batch_size(
+            'RAPID_DOC_LAYOUT_BATCH_SIZE', base_layout * self.batch_ratio
+        )
         self.use_doc_orientation_classify = (str(os.getenv("USE_DOC_ORIENTATION_CLASSIFY", "false"))
                                              .strip().lower() in ("true", "1", "yes", "on"))
         # 公式配置
         self.formula_level = self.formula_config.get("formula_level", 0)
         base_formula = self.formula_config.get("batch_num", 1)
-        self.formula_base_batch_size = base_formula * self.batch_ratio
+        self.formula_base_batch_size = get_env_batch_size(
+            'RAPID_DOC_FORMULA_BATCH_SIZE', base_formula * self.batch_ratio
+        )
         self.formula_bbox_expand_px = int(self.formula_config.get("bbox_expand_px", 2))
         
         # 表格配置
@@ -443,7 +459,12 @@ class BatchAnalyze:
                         all_imgs.append(cv2.cvtColor(np.asarray(td["table_img"]), cv2.COLOR_RGB2BGR))
                         idx_map.append((page_idx, id(td)))
                 if all_imgs:
-                    cls_results, cls_scores, _ = table_model.table_cls(all_imgs, batch_size=32, return_scores=True)
+                    table_cls_batch_size = get_env_batch_size(
+                        'RAPID_DOC_TABLE_CLS_BATCH_SIZE', 32
+                    )
+                    cls_results, cls_scores, _ = table_model.table_cls(
+                        all_imgs, batch_size=table_cls_batch_size, return_scores=True
+                    )
                     for (pi, tid), cls, score in zip(idx_map, cls_results, cls_scores):
                         precomputed_classes[tid] = (cls, score)
             except Exception:
@@ -496,9 +517,12 @@ class BatchAnalyze:
                 ocr_config=self.ocr_config,
             )
             rec_model = getattr(getattr(ocr_model, 'ocr_engine', None), 'text_rec', None)
-            GPU_BATCH = 128
+            table_rec_batch_override = get_env_batch_size('RAPID_DOC_TABLE_REC_BATCH_SIZE')
+            GPU_BATCH = 128 if table_rec_batch_override is None else table_rec_batch_override
             if rec_model is not None and hasattr(rec_model, 'cfg') and hasattr(rec_model.cfg, 'rec_batch_num'):
                 rec_model.cfg.rec_batch_num = min(GPU_BATCH, len(crop_imgs))
+            if table_rec_batch_override is not None and hasattr(rec_model, 'rec_batch_num'):
+                rec_model.rec_batch_num = min(GPU_BATCH, len(crop_imgs))
 
             # 按批 pad + 推理：全量 pad 到全局最大尺寸再一次性推理在表格
             # 较多时可达数十 GB（数千 cell × max 尺寸），必须分批降低峰值。

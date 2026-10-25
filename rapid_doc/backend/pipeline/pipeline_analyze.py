@@ -6,7 +6,7 @@ from loguru import logger
 
 from .model_init import MineruPipelineModel
 from ...cli.common import convert_pdf_to_bytes_by_pypdfium2
-from ...utils.config_reader import get_device
+from ...utils.config_reader import get_device, get_env_batch_size
 from ...utils.enum_class import ImageType
 from ...utils.hash_utils import make_hashable
 from ...utils.pdf_classify import classify
@@ -114,7 +114,8 @@ def doc_analyze(
         pdf_bytes_list = pdf_bytes_list_all
     """
     适当调大MIN_BATCH_INFERENCE_SIZE可以提高性能，更大的 MIN_BATCH_INFERENCE_SIZE会消耗更多内存，
-    可通过环境变量MINERU_MIN_BATCH_INFERENCE_SIZE设置，默认值为384。
+    可通过环境变量RAPID_DOC_PAGE_BATCH_SIZE设置，默认值为384；
+    兼容旧环境变量MINERU_MIN_BATCH_INFERENCE_SIZE。
     """
     # -------- 参数归一化 --------
     original_image_list = []
@@ -134,7 +135,11 @@ def doc_analyze(
 
     if lang_list is None:
         lang_list = ["ch"] * len(pdf_bytes_list)
-    min_batch_inference_size = int(os.environ.get('MINERU_MIN_BATCH_INFERENCE_SIZE', 384))
+    page_batch_size = get_env_batch_size('RAPID_DOC_PAGE_BATCH_SIZE')
+    if page_batch_size is None:
+        min_batch_inference_size = int(os.environ.get('MINERU_MIN_BATCH_INFERENCE_SIZE', 384))
+    else:
+        min_batch_inference_size = page_batch_size
 
     # 收集所有页面信息
     all_pages_info = []  # 存储(dataset_index, page_index, img, ocr, lang, width, height)

@@ -338,7 +338,13 @@ def batch_image_analyze(
             table_config = {}
         table_config.setdefault('engine_type', TableEngineType.OPENVINO)
         table_cfg = table_config.setdefault('engine_cfg', {})
-        table_cfg.setdefault('device', 'GPU')
+        # The OpenVINO GPU plugin can corrupt its context after long table
+        # batches, surfacing as SIGSEGV in a later OCR/layout inference. Keep
+        # table inference on CPU by default; use RAPID_DOC_TABLE_GPU=1 to opt
+        # back into GPU tables together with RAPID_DOC_UNET_GPU=1 if wanted.
+        table_device = 'GPU' if os.getenv('RAPID_DOC_TABLE_GPU') == '1' else 'CPU'
+        table_cfg.setdefault('device', table_device)
+        table_config.setdefault('wireless_device', table_device)
         table_cfg.setdefault('performance_hint', 'THROUGHPUT')
         table_cfg.setdefault('performance_num_requests', 4)
 

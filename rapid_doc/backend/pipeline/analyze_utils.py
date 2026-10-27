@@ -610,8 +610,7 @@ def _prepare_table_data(
                         table_res_dict['table_res']['table_parse_method'] = 'docvortex_native'
                         return
                     logger.info(
-                        'DocVortex native table too sparse (%.2f), fallback to model',
-                        blank_ratio,
+                        f'DocVortex native table too sparse ({blank_ratio:.2f}), fallback to model'
                     )
             except ImportError:
                 raise
@@ -664,8 +663,7 @@ def _prepare_table_data(
                             table_res_dict['table_res']['table_parse_method'] = 'pdfium_rule'
                             return None  # rule-based success
                         logger.info(
-                            'PDFium rule table too sparse (%.2f), fallback to model',
-                            blank_ratio,
+                            f'PDFium rule table too sparse ({blank_ratio:.2f}), fallback to model'
                         )
         except Exception as exc:
             logger.warning(f'PDFium rule table failed, fallback to model: {exc}')

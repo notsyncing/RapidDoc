@@ -245,7 +245,7 @@ def _run_ocr_det_batch(
 
         # GPU 模式：所有 crop 统一 pad 到全局最大尺寸 → 单一 GPU shape → 无需重编译
         device = ocr_config.get("Det.device", "cpu")
-        if "gpu" in device.lower() or "openvino" in device.lower():
+        if ocr_config.get("sycl_infer") or "gpu" in device.lower() or "openvino" in device.lower():
             max_h = max_w = 0
             for info in lang_crop_list:
                 bgr_image, _, _, _, adjusted_mfdetrec_res, _, _, _ = info
@@ -824,9 +824,18 @@ def _run_batched_table_inference(table_config, batch_data: List[tuple]):
                 img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             imgs.append(img)
         ocrs = [e[2]['ocr_result'] for e in entries]
-        bs = min(len(imgs), get_env_batch_size('RAPID_DOC_TABLE_STRUCTURE_BATCH_SIZE', 16))
+        n_real = len(imgs)
+        bs = max(1, get_env_batch_size('RAPID_DOC_TABLE_STRUCTURE_BATCH_SIZE', 16))
+        # Keep the GPU table input batch shape constant. Changing the batch
+        # dimension on every document makes the GPU plugin launch asynchronous
+        # oneDNN/kernel compilation for each shape; that background work can
+        # race with the next request and corrupt the plugin context.
+        if n_real and n_real % bs:
+            pad = bs - (n_real % bs)
+            imgs.extend([imgs[-1]] * pad)
+            ocrs.extend([ocrs[-1]] * pad)
         try:
-            return model(imgs, ocrs, batch_size=bs).pred_htmls
+            return model(imgs, ocrs, batch_size=bs).pred_htmls[:n_real]
         except Exception:
             return [e[1].predict(**e[2]) for e in entries]
 

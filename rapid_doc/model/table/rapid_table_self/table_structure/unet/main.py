@@ -43,6 +43,9 @@ class TSRUnetStructurer:
         self.std = np.array([58.395, 57.12, 57.375], dtype=np.float32)
         self.inp_height = 1024
         self.inp_width = 1024
+        self._gpu_input = (
+            str(cfg.get("engine_cfg", {}).get("device", "")).upper() == "GPU"
+        )
 
         if isinstance(cfg["engine_type"], str):
             cfg["engine_type"] = EngineType(cfg["engine_type"])
@@ -97,7 +100,17 @@ class TSRUnetStructurer:
 
     def preprocess(self, img) -> Dict[str, Any]:
         scale = (self.inp_height, self.inp_width)
+        # UNET has a dynamic spatial input. On the GPU plugin every distinct
+        # aspect ratio triggers an asynchronous kernel compile; across a large
+        # document those background compiles race and crash. For GPU, preserve
+        # aspect ratio, pad to a fixed 1024x1024, and crop the prediction back
+        # to the valid area. CPU keeps the original aspect-preserving path.
         img, _, _ = resize_img(img, scale, True)
+        valid_h, valid_w = img.shape[:2]
+        if self._gpu_input:
+            padded = np.zeros((self.inp_height, self.inp_width, 3), dtype=np.uint8)
+            padded[:valid_h, :valid_w] = img
+            img = padded
         img = img.copy().astype(np.float32)
         assert img.dtype != np.uint8
         mean = np.float64(self.mean.reshape(1, -1))
@@ -107,11 +120,15 @@ class TSRUnetStructurer:
         cv2.multiply(img, stdinv, img)  # inplace
         img = img.transpose(2, 0, 1)
         images = img[None, :]
-        return {"img": images}
+        return {"img": images, "valid_h": valid_h, "valid_w": valid_w}
 
     def infer(self, input):
         result = self.session(input["img"])[0][0]
         result = result[0].astype(np.uint8)
+        valid_h = input.get("valid_h")
+        valid_w = input.get("valid_w")
+        if valid_h and valid_w:
+            result = result[:valid_h, :valid_w]
         return result
 
     def postprocess(self, img, pred, **kwargs):

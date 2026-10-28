@@ -95,9 +95,10 @@ class OpenVINOInferSession(InferSession):
         if device.upper() == 'GPU':
             # Table models stay on the plugin default precision. Forcing f32
             # here triggers stack corruption on some Intel GPU builds.
-            # 允许 GPU 分配超过设备默认单块上限（常见 4GB）的 buffer，
-            # 避免大输入触发 "Exceeded max size of memory object allocation"。
-            enable_large_allocations = engine_cfg.get("enable_large_allocations", True)
+            # Only opt in for a genuinely large single allocation. Enabling
+            # this globally switches the GPU allocator mode and can destabilize
+            # the context for ordinary table inputs.
+            enable_large_allocations = engine_cfg.get("enable_large_allocations", False)
             config["GPU_ENABLE_LARGE_ALLOCATIONS"] = bool(enable_large_allocations)
 
         self.logger.info(f"Using OpenVINO config: {config}")

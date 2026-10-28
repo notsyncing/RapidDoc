@@ -28,7 +28,8 @@ class OpenVINOInferSession(InferSession):
         super().__init__(cfg)
         self.logger = Logger(logger_name=__name__).get_log()
 
-        core = Core()
+        from rapid_doc.utils.openvino_core import get_openvino_core
+        core = get_openvino_core()
 
         if cfg.model_dir_or_path is None:
             model_path = ModelProcessor.get_model_path(cfg.model_type, cfg.engine_type)
@@ -42,11 +43,11 @@ class OpenVINOInferSession(InferSession):
         self.onnx_model = onnx.load(self.model_path)  # 读取 ONNX 文件
 
         config = self._init_config(cfg)
-        core.set_property("CPU", config)
-
         model_onnx = core.read_model(model_path)
 
-        compile_model = core.compile_model(model=model_onnx, device_name="CPU")
+        compile_model = core.compile_model(
+            model=model_onnx, device_name="CPU", config=config
+        )
         # self.session = compile_model.create_infer_request()
         self.session = compile_model
 

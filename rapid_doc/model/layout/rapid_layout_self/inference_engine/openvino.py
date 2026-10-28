@@ -88,9 +88,10 @@ class OpenVINOInferSession(InferSession):
             )
             if precision:
                 config["INFERENCE_PRECISION_HINT"] = str(precision)
-            # 允许 GPU 分配超过设备默认单块上限（常见 4GB）的 buffer，
-            # 避免大输入触发 "Exceeded max size of memory object allocation"。
-            enable_large_allocations = engine_cfg.get("enable_large_allocations", True)
+            # Only opt in for a genuinely large single allocation. Enabling
+            # this globally switches the GPU allocator mode and can destabilize
+            # the context for ordinary layout inputs.
+            enable_large_allocations = engine_cfg.get("enable_large_allocations", False)
             config["GPU_ENABLE_LARGE_ALLOCATIONS"] = bool(enable_large_allocations)
         else:
             infer_num_threads = engine_cfg.get("inference_num_threads", -1)

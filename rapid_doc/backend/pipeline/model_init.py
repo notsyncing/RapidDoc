@@ -19,14 +19,14 @@ def table_model_init(lang=None, ocr_config=None, table_config=None):
     if ocr_config is not None:
         ocr_config_clean = copy.deepcopy(ocr_config)
         ocr_config_clean.pop("custom_model", None)
+    # Reuse the process-wide OCR engine instead of compiling a second
+    # table-specific OCR model. A second GPU OCR engine competes for the same
+    # OpenVINO GPU context and was the main source of post-table instability.
     atom_model_manager = AtomModelSingleton()
     ocr_engine = atom_model_manager.get_atom_model(
         atom_model_name=AtomicModel.OCR,
-        det_db_box_thresh=0.5,
-        det_db_unclip_ratio=1.6,
         lang=lang,
         ocr_config=ocr_config_clean,
-        enable_merge_det_boxes=False
     )
     table_model = RapidTableModel(ocr_engine, table_config)
     return table_model

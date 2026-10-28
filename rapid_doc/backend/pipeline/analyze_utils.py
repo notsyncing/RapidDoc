@@ -148,8 +148,8 @@ def _gpu_det_mem_budget() -> int:
         except ValueError:
             pass
     try:
-        import openvino as ov
-        core = ov.Core()
+        from rapid_doc.utils.openvino_core import get_openvino_core
+        core = get_openvino_core()
         if 'GPU' in core.available_devices:
             total_mem = int(core.get_property('GPU', 'GPU_DEVICE_TOTAL_MEM_SIZE'))
             budget = int(total_mem * 0.15)

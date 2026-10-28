@@ -53,15 +53,14 @@ class RapidTableModel(object):
         # if device.startswith('cpu') and check_openvino() and not self.engine_type:
         #     self.engine_type = EngineType.OPENVINO
 
-        # UNET's GPU backend can corrupt the OpenVINO GPU context after many
-        # table calls in a long-lived API process. Keep wired UNET on CPU by
-        # default; SLANET/wireless and layout can stay on GPU. Set
-        # RAPID_DOC_UNET_GPU=1 to opt back into GPU UNET.
+        # Wired UNET also runs on GPU by default now that all engines share
+        # one Core and one OCR engine. Set RAPID_DOC_UNET_CPU=1 only as a
+        # diagnostic/fallback.
         wired_engine_cfg = dict(engine_cfg)
         if (
             self.engine_type == EngineType.OPENVINO
             and "GPU" in str(wired_engine_cfg.get("device", "")).upper()
-            and os.getenv("RAPID_DOC_UNET_GPU") != "1"
+            and os.getenv("RAPID_DOC_UNET_CPU") == "1"
         ):
             wired_engine_cfg["device"] = "CPU"
 

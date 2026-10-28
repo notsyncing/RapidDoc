@@ -74,11 +74,8 @@ def check_openvino(target_device="CPU", require_intel_cpu=True):
             return False
 
     try:
-        try:
-            from openvino import Core
-        except ImportError:
-            from openvino.runtime import Core  # 兼容旧版本
-        core = Core()
+        from rapid_doc.utils.openvino_core import get_openvino_core
+        core = get_openvino_core()
         devices = [str(device).upper() for device in core.available_devices]
         if target_device:
             return any(d == target_device or d.startswith(target_device + ".") for d in devices)

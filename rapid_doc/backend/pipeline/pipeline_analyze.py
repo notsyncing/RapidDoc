@@ -338,23 +338,21 @@ def batch_image_analyze(
             table_config = {}
         table_config.setdefault('engine_type', TableEngineType.OPENVINO)
         table_cfg = table_config.setdefault('engine_cfg', {})
-        # The OpenVINO GPU plugin can corrupt its context after long table
-        # batches, surfacing as SIGSEGV in a later OCR/layout inference. Keep
-        # table inference on CPU by default; use RAPID_DOC_TABLE_GPU=1 to opt
-        # back into GPU tables together with RAPID_DOC_UNET_GPU=1 if wanted.
-        table_device = 'GPU' if os.getenv('RAPID_DOC_TABLE_GPU') == '1' else 'CPU'
+        # Keep table inference on the GPU by default. A single process-wide
+        # Core plus one shared OCR engine keeps the GPU context stable; set
+        # RAPID_DOC_TABLE_CPU=1 only as a diagnostic/fallback.
+        table_device = 'CPU' if os.getenv('RAPID_DOC_TABLE_CPU') == '1' else 'GPU'
         table_cfg.setdefault('device', table_device)
         table_config.setdefault('wireless_device', table_device)
         table_cfg.setdefault('performance_hint', 'THROUGHPUT')
         table_cfg.setdefault('performance_num_requests', 4)
 
-        # Enable OpenVINO GPU model cache to skip JIT on restart
+        # Enable OpenVINO GPU model cache to skip JIT on restart. Do this via
+        # compile config only: a second ov.Core() creates a separate GPU plugin
+        # instance and can invalidate the shared long-lived Core's context.
         try:
-            import openvino as ov
             cache_dir = os.path.join(os.path.expanduser('~'), '.cache', 'openvino_gpu_cache')
             os.makedirs(cache_dir, exist_ok=True)
-            ov_core = ov.Core()
-            ov_core.set_property("GPU", {"CACHE_DIR": cache_dir})
             layout_cfg.setdefault('cache_dir', cache_dir)
             table_cfg.setdefault('cache_dir', cache_dir)
             logger.info(f'OpenVINO GPU cache dir: {cache_dir}')

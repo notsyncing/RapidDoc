@@ -18,9 +18,7 @@ from ..model_processor.main import ModelProcessor
 from ..utils.logger import Logger
 from .base import InferSession
 from rapid_doc.utils.openvino_core import get_openvino_core
-
-
-_COMPILED_MODELS: Dict[str, Any] = {}
+from rapid_doc.utils.openvino_static import StaticShapeRunner
 
 class OpenVINOInferSession(InferSession):
     def __init__(self, cfg):
@@ -41,17 +39,27 @@ class OpenVINOInferSession(InferSession):
         self.device = device
         self.ov_config = ov_config
 
-        cache_key = f"{model_path}:{device}"
         self.core = get_openvino_core()
-        if cache_key in _COMPILED_MODELS:
-            self.model, self.compiled_model, self.input_tensor, self.output_tensors = _COMPILED_MODELS[cache_key]
-        else:
-            self.model = self.core.read_model(model=str(model_path))
-            self.input_tensor = self.model.inputs[0]
-            self.output_tensors = self.model.outputs
-            self.compiled_model = self.core.compile_model(self.model, device, ov_config)
-            _COMPILED_MODELS[cache_key] = (self.model, self.compiled_model, self.input_tensor, self.output_tensors)
-        self.infer_request = self.compiled_model.create_infer_request()
+        # Keep the unreshaped model for character/RT metadata, but run every
+        # inference on a static-shape compiled bucket.
+        self.model = self.core.read_model(model=str(self.model_path))
+        self.input_tensor = self.model.inputs[0]
+        self.input_name = self.input_tensor.get_any_name()
+        self.output_tensors = self.model.outputs
+        model_type = str(cfg.get("model_type", "table"))
+        # SLANET's graph cannot be compiled with fully static H/W (the GPU
+        # plugin crashes), but it accepts a spatial-static, batch-dynamic
+        # model.  All other table models are compiled fully static.
+        is_slanet = "slanet" in model_type.lower()
+        self.runner = StaticShapeRunner(
+            self.core,
+            self.model_path,
+            device,
+            ov_config,
+            label=f"table-{model_type}",
+            static_mode="spatial" if is_slanet else "full",
+            spatial_shape=(3, 488, 488) if is_slanet else None,
+        )
 
     def _init_config(self, cfg) -> Dict[Any, Any]:
         config = {}
@@ -106,26 +114,17 @@ class OpenVINOInferSession(InferSession):
 
     def __call__(self, input_content: np.ndarray) -> Any:
         try:
-            input_tensor_name = self.input_tensor.get_any_name()
-            self.infer_request.set_tensor(input_tensor_name, ov.Tensor(input_content))
-            self.infer_request.start_async()
-            self.infer_request.wait()
-
-            outputs = []
-            for output_tensor in self.output_tensors:
-                output_tensor_name = output_tensor.get_any_name()
-                output = np.array(self.infer_request.get_tensor(output_tensor_name).data)
-                outputs.append(output)
-
-            # NOTE: do NOT delete and recreate infer_request here (see the
-            # layout engine): on Intel GPUs the recreated request returns
-            # empty/corrupted results from the second inference onward.
-
-            return outputs
-
+            return self.runner.run(
+                {self.input_name: np.asarray(input_content)}
+            )
         except Exception as e:
             error_info = traceback.format_exc()
             raise OpenVIONError(error_info) from e
+
+    def precompile(self, shape) -> None:
+        self.runner.precompile(
+            {self.input_name: np.zeros(shape, dtype=np.float32)}
+        )
 
     def get_input_names(self) -> List[str]:
         return [tensor.get_any_name() for tensor in self.model.inputs]

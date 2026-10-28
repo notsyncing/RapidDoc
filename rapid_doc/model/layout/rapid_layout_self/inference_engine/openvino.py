@@ -26,11 +26,9 @@ if openvino_version < Version("2025.4.0"):
 from ..model_handler.utils import ModelProcessor
 from ..utils.logger import Logger
 from rapid_doc.utils.openvino_core import get_openvino_core
+from rapid_doc.utils.openvino_static import StaticShapeRunner
 from ..utils.typings import RapidLayoutInput
 from .base import InferSession
-
-
-_COMPILED_MODELS: Dict[str, Any] = {}
 
 class OpenVINOInferSession(InferSession):
     def __init__(self, cfg: RapidLayoutInput):
@@ -50,17 +48,19 @@ class OpenVINOInferSession(InferSession):
         ov_config = self._init_config(cfg)
         self.device = device
 
-        cache_key = f"{model_path}:{device}"
         self.core = get_openvino_core()
-        if cache_key in _COMPILED_MODELS:
-            self.model, self.compiled_model, self.input_tensor, self.output_tensors = _COMPILED_MODELS[cache_key]
-        else:
-            self.model = self.core.read_model(model=str(model_path))
-            self.input_tensor = self.model.inputs[0]
-            self.output_tensors = self.model.outputs
-            self.compiled_model = self.core.compile_model(self.model, device, ov_config)
-            _COMPILED_MODELS[cache_key] = (self.model, self.compiled_model, self.input_tensor, self.output_tensors)
-        self.infer_request = self.compiled_model.create_infer_request()
+        # Keep the unreshaped model for labels/RT metadata, but run every
+        # inference on a static-shape compiled bucket.
+        self.model = self.core.read_model(model=str(self.model_path))
+        self.input_tensor = self.model.inputs[0]
+        self.output_tensors = self.model.outputs
+        self.runner = StaticShapeRunner(
+            self.core,
+            self.model_path,
+            device,
+            ov_config,
+            label="layout",
+        )
 
     def _init_config(self, cfg: RapidLayoutInput) -> Dict[Any, Any]:
         config = {}
@@ -119,44 +119,29 @@ class OpenVINOInferSession(InferSession):
 
     def __call__(self, input_content: np.ndarray, scale_factor: np.ndarray = None) -> Any:
         try:
+            inputs = {"image": np.asarray(input_content)}
             if scale_factor is not None:
-                input_names = self.get_input_names()
-                for name in input_names:
-                    if name == "image":
-                        self.infer_request.set_tensor(name, ov.Tensor(input_content))
-                    elif name == "scale_factor":
-                        self.infer_request.set_tensor(name, ov.Tensor(scale_factor))
-                    elif name == "im_shape":
-                        h, w = input_content.shape[-2:]
-                        im_shape = np.array([[h, w]], dtype=np.float32)
-                        self.infer_request.set_tensor(name, ov.Tensor(im_shape))
-            else:
-                input_tensor_name = self.input_tensor.get_any_name()
-                self.infer_request.set_tensor(input_tensor_name, ov.Tensor(input_content))
-
-            # self.infer_request.infer()
-            # 使用异步推理替代同步 infer()
-            self.infer_request.start_async()
-            self.infer_request.wait()  # 等待推理完成
-
-            outputs = []
-            for output_tensor in self.output_tensors:
-                output_tensor_name = output_tensor.get_any_name()
-                output = np.array(self.infer_request.get_tensor(output_tensor_name).data)
-                outputs.append(output)
-
-            # NOTE: do NOT delete and recreate infer_request here. Recreating
-            # after every call makes the GPU plugin return empty/corrupted
-            # results from the second inference onward on Intel GPUs
-            # (Arc A770: full-page layout boxes after batch-shape switches;
-            # Iris Xe: empty outputs). Output tensors are copied with
-            # np.array() above, so no buffers are pinned by the caller.
-
-            return outputs
-
+                inputs["scale_factor"] = np.asarray(scale_factor)
+            if "im_shape" in self.get_input_names():
+                h, w = input_content.shape[-2:]
+                batch = input_content.shape[0]
+                inputs["im_shape"] = np.asarray(
+                    [[h, w]], dtype=np.float32
+                ).repeat(batch, axis=0)
+            return self.runner.run(inputs)
         except Exception as e:
             error_info = traceback.format_exc()
             raise OpenVIONError(error_info) from e
+
+    def precompile(self, batch: int = 1) -> None:
+        h = w = 800
+        inputs = {
+            "image": np.zeros((batch, 3, h, w), dtype=np.float32),
+            "im_shape": np.asarray([[h, w]], dtype=np.float32).repeat(batch, axis=0),
+            "scale_factor": np.ones((batch, 2), dtype=np.float32),
+        }
+        names = set(self.get_input_names())
+        self.runner.precompile({k: v for k, v in inputs.items() if k in names})
 
     def get_input_names(self) -> List[str]:
         return [tensor.get_any_name() for tensor in self.model.inputs]

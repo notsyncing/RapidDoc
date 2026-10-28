@@ -22,10 +22,17 @@ from rapidocr import RapidOCR, EngineType, OCRVersion
 from rapidocr.ch_ppocr_rec import TextRecInput, TextRecOutput
 from tqdm import tqdm
 
-from rapid_doc.utils.config_reader import get_device
+from rapid_doc.utils.config_reader import get_device, get_env_batch_size
 from rapid_doc.utils.model_utils import check_openvino
 from rapid_doc.utils.openvino_shapes import (
-    OCR_REC_BATCH, OCR_REC_MAX_WH_RATIO, det_canvas_size, pad_det_to_canvas,
+    BATCH_BUCKETS,
+    OCR_REC_HEIGHT,
+    det_square_bucket,
+    padded_batches,
+    pad_det_to_square,
+    rec_batch_limit,
+    rec_required_width,
+    rec_width_bucket,
 )
 from rapid_doc.utils.ocr_utils import check_img, preprocess_image, sorted_boxes, merge_det_boxes, update_det_boxes, get_rotate_crop_image
 from rapidocr.inference_engine.base import InferSession
@@ -412,8 +419,8 @@ class RapidOcrModel(object):
         det_img = img
         det_scale = 1.0
         if self._openvino_gpu:
-            canvas = det_canvas_size(img.shape[0], img.shape[1])
-            det_img, det_scale = pad_det_to_canvas(img, canvas)
+            canvas = det_square_bucket(max(img.shape[0], img.shape[1]))
+            det_img, det_scale = pad_det_to_square(img, canvas)
         det_res = self.text_detector(det_img)
         dt_boxes, elapse = det_res.boxes, det_res.elapse
         if dt_boxes is not None and len(dt_boxes) > 0 and det_scale != 1.0:
@@ -463,8 +470,12 @@ class RapidOcrModel(object):
 
 
     def text_recognizer_call(self, args: TextRecInput, tqdm_enable=False, tqdm_desc="OCR-rec Predict") -> TextRecOutput:
-        """
-        复制 TextRecognizer 类 __call__方法，增加进度条显示
+        """Recognise crops on bucketed static shapes.
+
+        Crops are sorted by aspect ratio, so every batch contains similar
+        lines.  The batch size is the next bucket (1/2/4/8/...), and the
+        recognition width is the smallest bucket that fits the batch's widest
+        line.  Nothing is padded to a global maximum.
         """
         img_list = [args.img] if isinstance(args.img, np.ndarray) else list(args.img)
         return_word_box = args.return_word_box
@@ -472,71 +483,117 @@ class RapidOcrModel(object):
         if real_img_num == 0:
             return TextRecOutput([], [], [], [], 0)
 
-        # Every GPU request must see the same recognition tensor
-        # (batch, 3, 48, W).  The last batch is padded with the last crop and
-        # W is fixed by the aspect-ratio cap below.  Both dimensions changing
-        # per request is what drives the GPU plugin's asynchronous kernel
-        # compilation and the production SIGSEGV.
-        batch_num = max(1, OCR_REC_BATCH)
-        padded_img_list = list(img_list)
-        missing = (-real_img_num) % batch_num
-        if missing:
-            padded_img_list.extend([padded_img_list[-1]] * missing)
-        img_num = len(padded_img_list)
+        # Required width before bucketing, used both for sorting and for
+        # grouping crops of similar aspect ratio.
+        required_widths = np.asarray(
+            [rec_required_width([img]) for img in img_list], dtype=np.int32
+        )
+        indices = np.argsort(required_widths, kind="stable")  # narrow -> wide
 
-        width_list = [img.shape[1] / float(img.shape[0]) for img in padded_img_list]
+        max_batch = get_env_batch_size(
+            "RAPID_DOC_OCR_REC_BATCH_SIZE", 64
+        ) or 64
+        try:
+            vocab = len(self.text_recognizer.postprocess_op.character)
+        except AttributeError:
+            vocab = 20000
+        rec_res = [("", 0.0)] * real_img_num
+        elapse = 0.0
+        session = self.text_recognizer.session
 
-        # Sorting can speed up the recognition process
-        indices = np.argsort(np.array(width_list))
+        # Split the sorted crops into width-bucket regions.  Narrow lines use
+        # a large batch; very wide lines use a smaller batch so the
+        # [batch, T, vocab] output stays bounded.
+        groups = []
+        pos = 0
+        while pos < real_img_num:
+            width_bucket = rec_width_bucket(int(required_widths[indices[pos]]))
+            end = pos + 1
+            while (
+                end < real_img_num
+                and rec_width_bucket(int(required_widths[indices[end]]))
+                == width_bucket
+            ):
+                end += 1
+            groups.append((indices[pos:end], width_bucket))
+            pos = end
 
-        rec_res = [("", 0.0)] * img_num
-        ratio_cap = OCR_REC_MAX_WH_RATIO
         with tqdm(total=real_img_num, desc=tqdm_desc, disable=not tqdm_enable) as pbar:
-            elapse = 0
-            for beg_img_no in range(0, img_num, batch_num):
-                end_img_no = min(img_num, beg_img_no + batch_num)
-
-                # Parameter Alignment for PaddleOCR
-                wh_ratio_list = []
-                for ino in range(beg_img_no, end_img_no):
-                    h, w = padded_img_list[indices[ino]].shape[0:2]
-                    wh_ratio_list.append(w * 1.0 / h)
-
-                # Keep the padded width fixed across batches: a changing width
-                # makes the executor retain one large buffer per shape and
-                # eventually loses the device on a long document.
-                max_wh_ratio = ratio_cap
-
-                norm_img_batch = []
-                for ino in range(beg_img_no, end_img_no):
-                    norm_img = self.text_recognizer.resize_norm_img(padded_img_list[indices[ino]], max_wh_ratio)
-                    norm_img_batch.append(norm_img[np.newaxis, :])
-                norm_img_batch = np.concatenate(norm_img_batch).astype(np.float32)
-
-                start_time = time.perf_counter()
-                preds = self.text_recognizer.session(norm_img_batch)
-                line_results, word_results = self.text_recognizer.postprocess_op(
-                    preds,
-                    return_word_box,
-                    wh_ratio_list=wh_ratio_list,
-                    max_wh_ratio=max_wh_ratio,
+            for group_indices, width_bucket in groups:
+                batch_limit = min(
+                    max_batch, rec_batch_limit(width_bucket, vocab)
                 )
+                for chunk, bucket, real_count in padded_batches(
+                    list(group_indices), batch_limit, BATCH_BUCKETS
+                ):
+                    real_indices = chunk[:real_count]
+                    real_images = [img_list[i] for i in real_indices]
+                    # The CTC word-box mapping multiplies token positions by
+                    # wh_ratio / max_wh_ratio.  Passing the bucket ratio keeps
+                    # the mapping correct even though the tensor is wider than
+                    # the widest real crop.
+                    max_wh_ratio = width_bucket / float(OCR_REC_HEIGHT)
 
-                for rno, one_res in enumerate(line_results):
-                    if return_word_box:
-                        rec_res[indices[beg_img_no + rno]] = (one_res, word_results[rno])
-                        continue
+                    padded_images = [img_list[i] for i in chunk]
+                    wh_ratio_list = [
+                        img.shape[1] * 1.0 / float(img.shape[0])
+                        for img in padded_images
+                    ]
+                    norm_img_batch = []
+                    for img in padded_images:
+                        norm_img = self.text_recognizer.resize_norm_img(
+                            img, max_wh_ratio
+                        )
+                        if norm_img.shape[2] < width_bucket:
+                            norm_img = np.pad(
+                                norm_img,
+                                ((0, 0), (0, 0),
+                                 (0, width_bucket - norm_img.shape[2])),
+                                mode="constant",
+                            )
+                        elif norm_img.shape[2] > width_bucket:
+                            norm_img = norm_img[:, :, :width_bucket]
+                        norm_img_batch.append(norm_img[np.newaxis, :])
+                    norm_img_batch = np.concatenate(norm_img_batch).astype(
+                        np.float32, copy=False
+                    )
 
-                    rec_res[indices[beg_img_no + rno]] = (one_res, None)
-                elapse += time.perf_counter() - start_time
+                    started = time.perf_counter()
+                    if hasattr(session, "run_argmax"):
+                        # sycl-infer can reduce the probability tensor on device.
+                        preds_idx, preds_prob = session.run_argmax(norm_img_batch)
+                        line_results, word_results = (
+                            self.text_recognizer.postprocess_op.decode(
+                                preds_idx,
+                                preds_prob,
+                                return_word_box,
+                                wh_ratio_list=wh_ratio_list,
+                                max_wh_ratio=max_wh_ratio,
+                                remove_duplicate=True,
+                            )
+                        )
+                    else:
+                        preds = session(norm_img_batch)
+                        line_results, word_results = (
+                            self.text_recognizer.postprocess_op(
+                                preds,
+                                return_word_box,
+                                wh_ratio_list=wh_ratio_list,
+                                max_wh_ratio=max_wh_ratio,
+                            )
+                        )
 
-                pbar.update(min(batch_num, max(0, real_img_num - beg_img_no)))
+                    for rno in range(min(real_count, len(line_results))):
+                        one_res = line_results[rno]
+                        if return_word_box:
+                            rec_res[real_indices[rno]] = (one_res, word_results[rno])
+                        else:
+                            rec_res[real_indices[rno]] = (one_res, None)
+                    elapse += time.perf_counter() - started
+                    pbar.update(real_count)
 
-            # Drop padded dummy results; real crops are always the first
-            # `real_img_num` entries because padding was appended.
-            rec_res = rec_res[:real_img_num]
-            all_line_results, all_word_results = list(zip(*rec_res))
-            txts, scores = list(zip(*all_line_results))
+        all_line_results, all_word_results = list(zip(*rec_res))
+        txts, scores = list(zip(*all_line_results))
         return TextRecOutput(
             img_list,
             txts,

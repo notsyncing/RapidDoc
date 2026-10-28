@@ -24,9 +24,9 @@ from rapidocr.utils.download_file import DownloadFile, DownloadFileInput
 from rapidocr.utils.log import logger
 from rapidocr.inference_engine.base import FileInfo, InferSession
 from rapid_doc.utils.openvino_core import get_openvino_core
+from rapid_doc.utils.openvino_static import StaticShapeRunner
 
 
-_COMPILED_MODELS: Dict[str, Any] = {}
 _DEFAULT_OCR_MODEL_DIR = None
 
 def _get_ocr_model_dir():
@@ -74,17 +74,23 @@ class OpenVINOInferSession(InferSession):
         device = cfg.get('device', 'CPU')
         ov_config = self._init_config(cfg)
 
-        cache_key = f"{model_path}:{device}"
-        if cache_key in _COMPILED_MODELS:
-            self.core, self.model, self.compiled_model, self.input_tensor, self.output_tensors = _COMPILED_MODELS[cache_key]
-        else:
-            self.core = get_openvino_core()
-            self.model = self.core.read_model(model=str(model_path))
-            self.input_tensor = self.model.inputs[0]
-            self.output_tensors = self.model.outputs
-            self.compiled_model = self.core.compile_model(self.model, device, ov_config)
-            _COMPILED_MODELS[cache_key] = (self.core, self.model, self.compiled_model, self.input_tensor, self.output_tensors)
-        self.infer_request = self.compiled_model.create_infer_request()
+        self.model_path = Path(model_path)
+        self.device = device
+        self.core = get_openvino_core()
+        # Read once for the input/output names.  Actual inference uses a
+        # static-shape model per bucket, compiled by the runner.
+        self.model = self.core.read_model(model=str(self.model_path))
+        self.input_tensor = self.model.inputs[0]
+        self.input_name = self.input_tensor.get_any_name()
+        self.output_tensors = self.model.outputs
+        task = getattr(cfg.get("task_type"), "value", cfg.get("task_type", "ocr"))
+        self.runner = StaticShapeRunner(
+            self.core,
+            self.model_path,
+            device,
+            ov_config,
+            label=f"ocr-{task}",
+        )
 
     def _init_config(self, cfg: DictConfig) -> Dict[Any, Any]:
         config = {}
@@ -141,25 +147,17 @@ class OpenVINOInferSession(InferSession):
 
     def __call__(self, input_content: np.ndarray) -> Any:
         try:
-            input_tensor_name = self.input_tensor.get_any_name()
-            self.infer_request.set_tensor(input_tensor_name, ov.Tensor(input_content))
-
-            # self.infer_request.infer()
-            # 使用异步推理替代同步 infer()
-            self.infer_request.start_async()
-            self.infer_request.wait()  # 等待推理完成
-
-            output_tensor_name = self.output_tensors[0].get_any_name()
-            output = np.array(self.infer_request.get_tensor(output_tensor_name).data)
-
-            # NOTE: do NOT delete and recreate infer_request here (see the
-            # layout engine): on Intel GPUs the recreated request returns
-            # empty/corrupted results from the second inference onward.
-
-            return output
+            return self.runner.run(
+                {self.input_name: np.asarray(input_content)}
+            )[0]
         except Exception as e:
             error_info = traceback.format_exc()
             raise OpenVIONError(error_info) from e
+
+    def precompile(self, shape) -> None:
+        self.runner.precompile(
+            {self.input_name: np.zeros(shape, dtype=np.float32)}
+        )
 
     def have_key(self, key: str = "character") -> bool:
         return False

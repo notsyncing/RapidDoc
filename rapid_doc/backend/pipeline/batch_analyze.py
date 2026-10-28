@@ -25,7 +25,11 @@ from ...utils.checkbox_det_cls import checkbox_predict
 from ...utils.config_reader import get_formula_enable, get_table_enable, get_env_batch_size
 from ...utils.enum_class import CategoryId
 from ...utils.model_utils import crop_img, get_res_list_from_layout_res, clean_vram
-from ...utils.openvino_shapes import TABLE_CLS_BATCH, det_canvas_size, pad_batch
+from ...utils.openvino_shapes import (
+    TABLE_CLS_MAX_BATCH,
+    det_square_bucket,
+    padded_batches,
+)
 from ...utils.pdf_image_tools import get_crop_np_img
 from ...utils.span_pre_proc import extract_table_fill_image
 
@@ -432,9 +436,9 @@ class BatchAnalyze:
             table_res_grouped.setdefault(x["page_idx"], []).append(x)
         total_tables = sum(len(tables) for tables in table_res_grouped.values())
 
-        # Phase 0: choose a fixed square detection canvas for every table crop.
-        # A document-derived max_h/max_w changes from request to request and
-        # makes the GPU plugin JIT a new detection kernel for each document.
+        # Phase 0: choose the nearest square detector bucket for the tables in
+        # this document.  The detector itself caps the long side at 960, so
+        # anything above that is pointless padding.
         max_h = max_w = 0
         for page_idx, table_list in table_res_grouped.items():
             for td in table_list:
@@ -443,7 +447,7 @@ class BatchAnalyze:
                 max_h = max(max_h, h)
                 max_w = max(max_w, w)
 
-        canvas = det_canvas_size(max_h, max_w) if max_h > 0 else None
+        canvas = det_square_bucket(max(max_h, max_w)) if max_h > 0 else None
         uniform_det_size = (canvas, canvas) if canvas else None
 
         # Phase 1a: batch table classifier
@@ -462,16 +466,17 @@ class BatchAnalyze:
                         all_imgs.append(cv2.cvtColor(np.asarray(td["table_img"]), cv2.COLOR_RGB2BGR))
                         idx_map.append((page_idx, id(td)))
                 if all_imgs:
-                    # Fixed classifier batch: the number of tables on a page
-                    # varies per request (3/18/21 in production), and changing
-                    # the batch shape causes the same GPU compile race.
-                    real_cls_count = len(all_imgs)
-                    all_imgs = all_imgs + [all_imgs[-1]] * ((-real_cls_count) % TABLE_CLS_BATCH)
-                    cls_results, cls_scores, _ = table_model.table_cls(
-                        all_imgs, batch_size=TABLE_CLS_BATCH, return_scores=True
-                    )
-                    cls_results = cls_results[:real_cls_count]
-                    cls_scores = cls_scores[:real_cls_count]
+                    # Bucket the classifier batch: a page with three tables
+                    # runs a batch of four, not a padded batch of 32.
+                    cls_results, cls_scores = [], []
+                    for chunk, bucket, real_count in padded_batches(
+                        all_imgs, TABLE_CLS_MAX_BATCH
+                    ):
+                        labels, scores, _ = table_model.table_cls(
+                            chunk, batch_size=bucket, return_scores=True
+                        )
+                        cls_results.extend(labels[:real_count])
+                        cls_scores.extend(scores[:real_count])
                     for (pi, tid), cls, score in zip(idx_map, cls_results, cls_scores):
                         precomputed_classes[tid] = (cls, score)
             except Exception:
@@ -521,27 +526,16 @@ class BatchAnalyze:
                 lang=batch_entries[deferred_indices[0]][2].get('_lang', 'ch'),
                 ocr_config=self.ocr_config,
             )
-            rec_model = getattr(getattr(ocr_model, 'ocr_engine', None), 'text_rec', None)
-            from ...utils.openvino_shapes import OCR_REC_BATCH
-            GPU_BATCH = OCR_REC_BATCH
-            if rec_model is not None and hasattr(rec_model, 'cfg') and hasattr(rec_model.cfg, 'rec_batch_num'):
-                rec_model.cfg.rec_batch_num = GPU_BATCH
-            if rec_model is not None and hasattr(rec_model, 'rec_batch_num'):
-                rec_model.rec_batch_num = GPU_BATCH
-
-            # RapidOCR resizes each crop to its recognition height itself and
-            # text_recognizer_call pads every call to a fixed batch/width.
-            rec_results_raw = []
-            for start in range(0, len(crop_imgs), GPU_BATCH):
-                batch = crop_imgs[start:start + GPU_BATCH]
-                try:
-                    batch_res = ocr_model.ocr(batch, det=False, tqdm_enable=False)[0]
-                except Exception as exc:
-                    logger.warning(f'table OCR-rec batch failed, use empty results: {exc}')
-                    batch_res = []
-                if len(batch_res) != len(batch):
-                    batch_res = (batch_res + [('', 0.0)] * len(batch))[:len(batch)]
-                rec_results_raw.extend(batch_res)
+            # ``text_recognizer_call`` sorts by width and chooses bucket
+            # batch/width, so pass all table cells at once.
+            rec_results_raw = ocr_model.ocr(
+                crop_imgs, det=False, tqdm_enable=False
+            )[0]
+            if len(rec_results_raw) != len(crop_imgs):
+                raise RuntimeError(
+                    f'table OCR-rec returned {len(rec_results_raw)}/'
+                    f'{len(crop_imgs)} results'
+                )
 
             idx_to_crops = defaultdict(list)
             for (crop_img, tbl_idx), rec_res in zip(all_crops, rec_results_raw or []):

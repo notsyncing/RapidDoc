@@ -16,6 +16,7 @@ import numpy as np
 from typing import Any, Dict, List, Tuple, Optional
 from ...inference_engine.base import get_engine
 from ...utils.typings import EngineType
+from rapid_doc.utils.openvino_shapes import unet_bucket_shape
 
 import copy
 import math
@@ -100,15 +101,17 @@ class TSRUnetStructurer:
 
     def preprocess(self, img) -> Dict[str, Any]:
         scale = (self.inp_height, self.inp_width)
-        # UNET has a dynamic spatial input. On the GPU plugin every distinct
-        # aspect ratio triggers an asynchronous kernel compile; across a large
-        # document those background compiles race and crash. For GPU, preserve
-        # aspect ratio, pad to a fixed 1024x1024, and crop the prediction back
-        # to the valid area. CPU keeps the original aspect-preserving path.
+        # UNET has a dynamic spatial input.  On the GPU plugin every distinct
+        # aspect ratio used to trigger an asynchronous kernel compile; the
+        # static-shape runner needs a concrete shape.  Keep the long side at
+        # 1024 and bucket only the short side, so a 1024x585 table runs at
+        # 1024x640 instead of 1024x1024.  The prediction is cropped back to
+        # the valid area afterwards.
         img, _, _ = resize_img(img, scale, True)
         valid_h, valid_w = img.shape[:2]
         if self._gpu_input:
-            padded = np.zeros((self.inp_height, self.inp_width, 3), dtype=np.uint8)
+            bucket_h, bucket_w = unet_bucket_shape(valid_h, valid_w)
+            padded = np.zeros((bucket_h, bucket_w, 3), dtype=np.uint8)
             padded[:valid_h, :valid_w] = img
             img = padded
         img = img.copy().astype(np.float32)

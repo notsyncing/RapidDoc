@@ -1,4 +1,5 @@
 # Copyright (c) Opendatalab. All rights reserved.
+import os
 import threading
 
 try:
@@ -30,4 +31,15 @@ def get_openvino_core():
     with _CORE_LOCK:
         if _CORE is None:
             _CORE = Core()
+            # Persist static compiled blobs across process restarts.  The
+            # cache key includes the model and the concrete bucket shape, so
+            # a restart does not need to recompile every bucket.
+            cache_dir = os.getenv("RAPID_DOC_OPENVINO_CACHE_DIR") or os.path.join(
+                os.path.expanduser("~"), ".cache", "openvino_gpu_cache"
+            )
+            try:
+                os.makedirs(cache_dir, exist_ok=True)
+                _CORE.set_property("GPU", {"CACHE_DIR": cache_dir})
+            except Exception:
+                pass
         return _CORE

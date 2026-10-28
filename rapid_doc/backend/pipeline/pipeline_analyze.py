@@ -84,12 +84,12 @@ def custom_model_init(
 
     custom_model = MineruPipelineModel(**model_input)
 
-    if device == 'openvino_gpu':
+    if device == 'openvino_gpu' and os.getenv('RAPID_DOC_OPENVINO_PRECOMPILE') == '1':
         try:
             from ...utils.openvino_warmup import warmup_openvino_gpu_pipeline
             warmup_openvino_gpu_pipeline(custom_model)
         except Exception as exc:
-            logger.warning(f'OpenVINO GPU warm-up failed: {exc}')
+            logger.warning(f'OpenVINO GPU precompile failed: {exc}')
 
     model_init_cost = time.time() - model_init_start
     logger.info(f'model init cost: {model_init_cost}')

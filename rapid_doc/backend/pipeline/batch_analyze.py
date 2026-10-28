@@ -25,6 +25,7 @@ from ...utils.checkbox_det_cls import checkbox_predict
 from ...utils.config_reader import get_formula_enable, get_table_enable, get_env_batch_size
 from ...utils.enum_class import CategoryId
 from ...utils.model_utils import crop_img, get_res_list_from_layout_res, clean_vram
+from ...utils.openvino_shapes import TABLE_CLS_BATCH, det_canvas_size, pad_batch
 from ...utils.pdf_image_tools import get_crop_np_img
 from ...utils.span_pre_proc import extract_table_fill_image
 
@@ -431,17 +432,19 @@ class BatchAnalyze:
             table_res_grouped.setdefault(x["page_idx"], []).append(x)
         total_tables = sum(len(tables) for tables in table_res_grouped.values())
 
-        # Phase 0: compute global max det image size for GPU uniform padding
-        RES_STRIDE = 64
+        # Phase 0: choose a fixed square detection canvas for every table crop.
+        # A document-derived max_h/max_w changes from request to request and
+        # makes the GPU plugin JIT a new detection kernel for each document.
         max_h = max_w = 0
         for page_idx, table_list in table_res_grouped.items():
             for td in table_list:
                 td["table_img"] = td["rect_table_img"]
                 h, w = td["rect_table_img"].shape[:2]
-                max_h = max(max_h, ((h + RES_STRIDE - 1) // RES_STRIDE) * RES_STRIDE)
-                max_w = max(max_w, ((w + RES_STRIDE - 1) // RES_STRIDE) * RES_STRIDE)
+                max_h = max(max_h, h)
+                max_w = max(max_w, w)
 
-        uniform_det_size = (max_h, max_w) if max_h > 0 else None
+        canvas = det_canvas_size(max_h, max_w) if max_h > 0 else None
+        uniform_det_size = (canvas, canvas) if canvas else None
 
         # Phase 1a: batch table classifier
         table_model = atom_model_manager.get_atom_model(
@@ -459,12 +462,16 @@ class BatchAnalyze:
                         all_imgs.append(cv2.cvtColor(np.asarray(td["table_img"]), cv2.COLOR_RGB2BGR))
                         idx_map.append((page_idx, id(td)))
                 if all_imgs:
-                    table_cls_batch_size = get_env_batch_size(
-                        'RAPID_DOC_TABLE_CLS_BATCH_SIZE', 32
-                    )
+                    # Fixed classifier batch: the number of tables on a page
+                    # varies per request (3/18/21 in production), and changing
+                    # the batch shape causes the same GPU compile race.
+                    real_cls_count = len(all_imgs)
+                    all_imgs = all_imgs + [all_imgs[-1]] * ((-real_cls_count) % TABLE_CLS_BATCH)
                     cls_results, cls_scores, _ = table_model.table_cls(
-                        all_imgs, batch_size=table_cls_batch_size, return_scores=True
+                        all_imgs, batch_size=TABLE_CLS_BATCH, return_scores=True
                     )
+                    cls_results = cls_results[:real_cls_count]
+                    cls_scores = cls_scores[:real_cls_count]
                     for (pi, tid), cls, score in zip(idx_map, cls_results, cls_scores):
                         precomputed_classes[tid] = (cls, score)
             except Exception:
@@ -515,16 +522,15 @@ class BatchAnalyze:
                 ocr_config=self.ocr_config,
             )
             rec_model = getattr(getattr(ocr_model, 'ocr_engine', None), 'text_rec', None)
-            table_rec_batch_override = get_env_batch_size('RAPID_DOC_TABLE_REC_BATCH_SIZE')
-            GPU_BATCH = 128 if table_rec_batch_override is None else table_rec_batch_override
+            from ...utils.openvino_shapes import OCR_REC_BATCH
+            GPU_BATCH = OCR_REC_BATCH
             if rec_model is not None and hasattr(rec_model, 'cfg') and hasattr(rec_model.cfg, 'rec_batch_num'):
-                rec_model.cfg.rec_batch_num = min(GPU_BATCH, len(crop_imgs))
-            if table_rec_batch_override is not None and hasattr(rec_model, 'rec_batch_num'):
-                rec_model.rec_batch_num = min(GPU_BATCH, len(crop_imgs))
+                rec_model.cfg.rec_batch_num = GPU_BATCH
+            if rec_model is not None and hasattr(rec_model, 'rec_batch_num'):
+                rec_model.rec_batch_num = GPU_BATCH
 
-            # RapidOCR resizes each crop to its recognition height itself.
-            # Padding raw table cells to the global max height shrinks short
-            # cells and corrupts their text, so batch the raw crops.
+            # RapidOCR resizes each crop to its recognition height itself and
+            # text_recognizer_call pads every call to a fixed batch/width.
             rec_results_raw = []
             for start in range(0, len(crop_imgs), GPU_BATCH):
                 batch = crop_imgs[start:start + GPU_BATCH]

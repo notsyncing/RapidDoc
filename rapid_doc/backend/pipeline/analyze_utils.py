@@ -25,6 +25,10 @@ from ...utils.boxbase import rotate_table_image
 from ...utils.config_reader import get_env_batch_size
 from ...utils.enum_class import CategoryId
 from ...utils.model_utils import crop_img
+from ...utils.openvino_shapes import (
+    det_batch_size as det_batch_for_canvas, det_canvas_size, pad_batch,
+    pad_det_to_canvas, OCR_REC_BATCH,
+)
 from ...utils.ocr_utils import (
     merge_det_boxes, update_det_boxes, sorted_boxes, get_rotate_crop_image,
     get_adjusted_mfdetrec_res, get_ocr_result_list, OcrConfidence, get_ocr_result_list_table
@@ -243,37 +247,47 @@ def _run_ocr_det_batch(
             ocr_config=ocr_config,
         )
 
-        # GPU 模式：所有 crop 统一 pad 到全局最大尺寸 → 单一 GPU shape → 无需重编译
+        # GPU 模式：先用文档统一缩放系数缩放内容，再 pad 到固定 960
+        # canvas + 固定 batch。content scale 与旧的全局 pad 路径一致，但
+        # (batch, H, W) 不再随文档/页数变化，GPU plugin 不需要为新 shape
+        # 异步编译 kernel。
         device = ocr_config.get("Det.device", "cpu")
         if ocr_config.get("sycl_infer") or "gpu" in device.lower() or "openvino" in device.lower():
-            max_h = max_w = 0
+            max_side = 0
             for info in lang_crop_list:
-                bgr_image, _, _, _, adjusted_mfdetrec_res, _, _, _ = info
-                det_image = _apply_mask_boxes_to_image(bgr_image, adjusted_mfdetrec_res)
-                h, w = det_image.shape[:2]
-                max_h = max(max_h, ((h + RESOLUTION_GROUP_STRIDE - 1) // RESOLUTION_GROUP_STRIDE) * RESOLUTION_GROUP_STRIDE)
-                max_w = max(max_w, ((w + RESOLUTION_GROUP_STRIDE - 1) // RESOLUTION_GROUP_STRIDE) * RESOLUTION_GROUP_STRIDE)
+                bgr_image = info[0]
+                max_side = max(max_side, bgr_image.shape[0], bgr_image.shape[1])
+            doc_scale = min(1.0, 960.0 / max_side) if max_side else 1.0
+            canvas = 960
+            fixed_batch = det_batch_for_canvas(canvas)
 
-            det_batch_size = min(len(lang_crop_list), ocr_det_base_batch_size)
-            det_batch_size = _gpu_safe_det_batch_size(max_h, max_w, det_batch_size)
-
-            # 按批 pad + 推理：避免全量 crop 的 pad 副本驻留系统内存
-            # （大文档下可达数 GB），每批推理完立即处理并释放。
-            for start in tqdm(range(0, len(lang_crop_list), det_batch_size), desc=f"OCR-det {lang}"):
-                batch_info = lang_crop_list[start:start + det_batch_size]
+            for start in tqdm(range(0, len(lang_crop_list), fixed_batch), desc=f"OCR-det {lang}"):
+                batch_info = lang_crop_list[start:start + fixed_batch]
                 batch_images = []
+                batch_scales = []
                 for info in batch_info:
                     bgr_image, _, _, _, adjusted_mfdetrec_res, _, _, _ = info
                     det_image = _apply_mask_boxes_to_image(bgr_image, adjusted_mfdetrec_res)
-                    h, w = det_image.shape[:2]
-                    padded = np.ones((max_h, max_w, 3), dtype=np.uint8) * 255
-                    padded[:h, :w] = det_image
+                    if doc_scale < 1.0:
+                        h, w = det_image.shape[:2]
+                        det_image = cv2.resize(
+                            det_image,
+                            (max(1, int(round(w * doc_scale))),
+                             max(1, int(round(h * doc_scale)))),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
+                    padded, extra_scale = pad_det_to_canvas(det_image, canvas)
                     batch_images.append(padded)
+                    batch_scales.append(doc_scale * extra_scale)
 
-                batch_results = ocr_model.det_batch_predict(batch_images, det_batch_size)
+                batch_images, real_count = pad_batch(batch_images, fixed_batch)
+                batch_scales, _ = pad_batch(batch_scales, fixed_batch, batch_scales[-1])
+                batch_results = ocr_model.det_batch_predict(batch_images, fixed_batch)
 
-                for info, (dt_boxes, _) in zip(batch_info, batch_results):
+                for info, scale, (dt_boxes, _) in zip(batch_info, batch_scales, batch_results[:real_count]):
                     bgr_image, _det_image, useful_list, ocr_res_dict, adjusted_mfdetrec_res, _lang, res, ocr_enable = info
+                    if dt_boxes is not None and len(dt_boxes) > 0 and scale != 1.0:
+                        dt_boxes = (np.asarray(dt_boxes, dtype=np.float32) / scale).tolist()
 
                     if dt_boxes is not None and len(dt_boxes) > 0:
                         dt_boxes_sorted = sorted_boxes(dt_boxes)
@@ -293,7 +307,6 @@ def _run_ocr_det_batch(
                             )
                             ocr_res_dict['layout_res'].extend(ocr_result_list)
 
-                # 处理完该批立即释放 bgr_image 引用，避免全量驻留
                 for i in range(start, start + len(batch_info)):
                     lang_crop_list[i] = None
         else:
@@ -388,13 +401,12 @@ def _run_ocr_rec_postprocess(images_layout_res: List[List[Dict]], ocr_config):
             # height and pads internally. Padding raw crops to the global
             # max height here shrinks short text lines and changes CTC input,
             # producing wrong characters; keep the batch but use raw crops.
-            rec_batch_override = get_env_batch_size('RAPID_DOC_OCR_REC_BATCH_SIZE')
-            GPU_BATCH = 128 if rec_batch_override is None else rec_batch_override
+            GPU_BATCH = OCR_REC_BATCH
             rec_model = ocr_model.ocr_engine.text_rec
             if hasattr(rec_model, 'cfg') and hasattr(rec_model.cfg, 'rec_batch_num'):
-                rec_model.cfg.rec_batch_num = min(GPU_BATCH, _orig_n)
-            if rec_batch_override is not None and hasattr(rec_model, 'rec_batch_num'):
-                rec_model.rec_batch_num = min(GPU_BATCH, _orig_n)
+                rec_model.cfg.rec_batch_num = GPU_BATCH
+            if hasattr(rec_model, 'rec_batch_num'):
+                rec_model.rec_batch_num = GPU_BATCH
 
             for start in range(0, _orig_n, GPU_BATCH):
                 batch = img_crop_list[start:start + GPU_BATCH]
@@ -688,19 +700,18 @@ def _prepare_table_data(
         if adjusted_mfdetrec_res
         else bgr_image
     )
-    # GPU 模式：表格检测图统一 pad 到全局最大尺寸 → 单一输入 shape → 一次 JIT
+    # GPU 模式：表格检测图统一 pad 到固定方形 canvas → 单一输入 shape
     device = ocr_config.get("Det.device", "cpu")
+    det_scale = 1.0
     if uniform_det_size is not None and ("gpu" in str(device).lower()):
-        tgt_h, tgt_w = uniform_det_size
-        h, w = det_image.shape[:2]
-        if h < tgt_h or w < tgt_w:
-            padded = np.ones((tgt_h, tgt_w, 3), dtype=np.uint8) * 255
-            padded[:h, :w] = det_image
-            det_image = padded
+        canvas = max(uniform_det_size)
+        det_image, det_scale = pad_det_to_canvas(det_image, canvas)
     det_res = _detect_table_text(
             ocr_model, det_image, adjusted_mfdetrec_res,
             retry_padding=ocr_det_retry_padding, retry_short_side=ocr_det_retry_short_side,
         )
+    if det_res is not None and len(det_res) > 0 and det_scale != 1.0:
+        det_res = (np.asarray(det_res, dtype=np.float32) / det_scale).tolist()
 
     angles = []
     rotate_label = "0"
@@ -722,10 +733,15 @@ def _prepare_table_data(
             if adjusted_mfdetrec_res
             else bgr_image
         )
+        det_scale = 1.0
+        if uniform_det_size is not None and ("gpu" in str(device).lower()):
+            det_image, det_scale = pad_det_to_canvas(det_image, max(uniform_det_size))
         det_res = _detect_table_text(
             ocr_model, det_image, adjusted_mfdetrec_res,
             retry_padding=ocr_det_retry_padding, retry_short_side=ocr_det_retry_short_side,
         )
+        if det_res is not None and len(det_res) > 0 and det_scale != 1.0:
+            det_res = (np.asarray(det_res, dtype=np.float32) / det_scale).tolist()
 
     ocr_result = []
 
@@ -836,30 +852,28 @@ def _run_batched_table_inference(table_config, batch_data: List[tuple]):
             ocrs.extend([ocrs[-1]] * pad)
         try:
             return model(imgs, ocrs, batch_size=bs).pred_htmls[:n_real]
-        except Exception:
-            return [e[1].predict(**e[2]) for e in entries]
+        except Exception as exc:
+            # Do not fall back to one-image inference here: that switches the
+            # compiled model back to batch 1 and reintroduces the shape churn.
+            logger.warning(f'fixed-batch table inference failed: {exc}')
+            return [None] * n_real
 
     # SLANET and UNET are both batch-safe. Run both models for normal tables
     # and pick the denser result; this avoids trusting a wrong wired/wireless
     # classifier while still using high-batch table-structure inference.
     if str(model_type) == "UNET_SLANET_PLUS" and os.getenv("RAPID_DOC_TABLE_SINGLE_MODEL") != "1":
-        batch_entries, special_entries = [], []
-        for entry in batch_data:
-            pk = entry[2]
-            if pk.get('fill_image_res') or pk.get('mfd_res'):
-                special_entries.append(entry)
-            else:
-                batch_entries.append(entry)
+        # Tables with fill images/formulas used to take a batch-1 "special"
+        # path while ordinary tables used batch 16.  On the GPU plugin that
+        # mixes two batch shapes for the same compiled SLANET model.  The OCR
+        # results are already materialised by _prepare_table_data, so every
+        # table can go through the same fixed-batch structure model.
+        batch_entries = list(batch_data)
 
         if os.getenv("RAPID_DOC_TABLE_PER_TABLE") == "1":
             for entry in batch_entries:
                 html_code = entry[1].predict(**entry[2])
                 normalized = normalize_table_html_cell_text(html_code) if html_code else None
                 if not _write_table_result(entry[0], normalized):
-                    _fallback_table_to_text(entry[0], entry[2])
-            for entry in special_entries:
-                html_code = entry[1].predict(**entry[2])
-                if not _write_table_result(entry[0], html_code):
                     _fallback_table_to_text(entry[0], entry[2])
             return
         wired_htmls = _batch_htmls(batch_entries, 'wired_table_model')
@@ -870,23 +884,18 @@ def _run_batched_table_inference(table_config, batch_data: List[tuple]):
             if html_code and _table_html_blank_ratio(html_code) > 0.4:
                 # A batched result can still be the wrong model for very long
                 # scanned tables. Re-run both models on just this table and pick
-                # the denser grid.
+                # the denser grid. Keep the fixed batch shape even for this
+                # single-table retry.
                 try:
-                    img = entry[2]['image']
-                    ocr = entry[2].get('ocr_result') or []
-                    w_single = entry[1].wired_table_model([img], [ocr]).pred_htmls[0]
-                    l_single = entry[1].wireless_table_model([img], [ocr]).pred_htmls[0]
-                    html_code = select_best_table_model(ocr or [[], [], []], w_single, l_single)
+                    w_single = _batch_htmls([entry], 'wired_table_model')[0]
+                    l_single = _batch_htmls([entry], 'wireless_table_model')[0]
+                    html_code = select_best_table_model(ocr_result or [[], [], []], w_single, l_single)
                 except Exception:
                     pass
             normalized = normalize_table_html_cell_text(html_code) if html_code else None
             if not _write_table_result(entry[0], normalized):
                 _fallback_table_to_text(entry[0], entry[2])
 
-        for entry in special_entries:
-            html_code = entry[1].predict(**entry[2])
-            if not _write_table_result(entry[0], html_code):
-                _fallback_table_to_text(entry[0], entry[2])
         return
 
     # Other combined models (UNITABLE) and single-model configurations keep
@@ -1044,22 +1053,14 @@ def _run_table_ocr(
         })
 
     cropped_img_list = [item["cropped_img"] for item in rec_img_list]
-    # GPU batch: 固定大小 power-of-2，余数 padd → 所有 batch 同 shape → 一次 JIT
+    # GPU batch: text_recognizer_call pads every call to a fixed batch and
+    # fixed width, so the number of cells in a table no longer changes the
+    # tensor shape.
     rec_model = getattr(getattr(ocr_model, 'ocr_engine', None), 'text_rec', None)
-    _tbl_n = len(cropped_img_list)
     if rec_model is not None and hasattr(rec_model, 'cfg') and hasattr(rec_model.cfg, 'rec_batch_num'):
-        rec_batch_override = get_env_batch_size('RAPID_DOC_TABLE_REC_BATCH_SIZE')
-        GPU_BATCH = 128 if rec_batch_override is None else rec_batch_override
-        if _tbl_n > GPU_BATCH:
-            pad = (GPU_BATCH - _tbl_n % GPU_BATCH) % GPU_BATCH
-            if pad:
-                dummy = np.zeros_like(cropped_img_list[0])
-                cropped_img_list = cropped_img_list + [dummy] * pad
-            rec_model.cfg.rec_batch_num = GPU_BATCH
-        else:
-            rec_model.cfg.rec_batch_num = _tbl_n
-        if rec_batch_override is not None and hasattr(rec_model, 'rec_batch_num'):
-            rec_model.rec_batch_num = min(GPU_BATCH, _tbl_n)
+        rec_model.cfg.rec_batch_num = OCR_REC_BATCH
+    if rec_model is not None and hasattr(rec_model, 'rec_batch_num'):
+        rec_model.rec_batch_num = OCR_REC_BATCH
 
     ocr_res_list = None
     try:

@@ -24,6 +24,9 @@ from tqdm import tqdm
 
 from rapid_doc.utils.config_reader import get_device
 from rapid_doc.utils.model_utils import check_openvino
+from rapid_doc.utils.openvino_shapes import (
+    OCR_REC_BATCH, OCR_REC_MAX_WH_RATIO, det_canvas_size, pad_det_to_canvas,
+)
 from rapid_doc.utils.ocr_utils import check_img, preprocess_image, sorted_boxes, merge_det_boxes, update_det_boxes, get_rotate_crop_image
 from rapidocr.inference_engine.base import InferSession
 from importlib.metadata import version
@@ -52,6 +55,7 @@ class RapidOcrModel(object):
         self.enable_merge_det_boxes = enable_merge_det_boxes
         self.is_seal = is_seal
         device = get_device()
+        self._openvino_gpu = device == 'openvino_gpu'
         # 默认配置
         default_params = {
             "Global.use_cls": False,
@@ -401,8 +405,19 @@ class RapidOcrModel(object):
             return None, None
 
         ori_im = img.copy()
-        det_res = self.text_detector(img)
+        # Full-OCR paths (numeric-cell repair, fallback table OCR, seal OCR)
+        # must see the same fixed detector canvas as the main pipeline.
+        # Otherwise this hidden path feeds the GPU plugin new H/W shapes and
+        # bypasses the recognition shape fix below.
+        det_img = img
+        det_scale = 1.0
+        if self._openvino_gpu:
+            canvas = det_canvas_size(img.shape[0], img.shape[1])
+            det_img, det_scale = pad_det_to_canvas(img, canvas)
+        det_res = self.text_detector(det_img)
         dt_boxes, elapse = det_res.boxes, det_res.elapse
+        if dt_boxes is not None and len(dt_boxes) > 0 and det_scale != 1.0:
+            dt_boxes = (np.asarray(dt_boxes, dtype=np.float32) / det_scale)
 
         if dt_boxes is None:
             logger.debug("no dt_boxes found, elapsed : {}".format(elapse))
@@ -430,7 +445,7 @@ class RapidOcrModel(object):
                 img_crop = get_rotate_crop_image(ori_im, tmp_box)
                 img_crop_list.append(img_crop)
 
-        rec_result = self.text_recognizer(TextRecInput(img_crop_list))
+        rec_result = self.text_recognizer_call(TextRecInput(img_crop_list))
         rec_res = list(zip(rec_result.txts, rec_result.scores))
         elapse = rec_result.elapse
         # logger.debug("rec_res num  : {}, elapsed : {}".format(len(rec_res), elapse))
@@ -451,37 +466,50 @@ class RapidOcrModel(object):
         """
         复制 TextRecognizer 类 __call__方法，增加进度条显示
         """
-        img_list = [args.img] if isinstance(args.img, np.ndarray) else args.img
+        img_list = [args.img] if isinstance(args.img, np.ndarray) else list(args.img)
         return_word_box = args.return_word_box
+        real_img_num = len(img_list)
+        if real_img_num == 0:
+            return TextRecOutput([], [], [], [], 0)
 
-        width_list = [img.shape[1] / float(img.shape[0]) for img in img_list]
+        # Every GPU request must see the same recognition tensor
+        # (batch, 3, 48, W).  The last batch is padded with the last crop and
+        # W is fixed by the aspect-ratio cap below.  Both dimensions changing
+        # per request is what drives the GPU plugin's asynchronous kernel
+        # compilation and the production SIGSEGV.
+        batch_num = max(1, OCR_REC_BATCH)
+        padded_img_list = list(img_list)
+        missing = (-real_img_num) % batch_num
+        if missing:
+            padded_img_list.extend([padded_img_list[-1]] * missing)
+        img_num = len(padded_img_list)
+
+        width_list = [img.shape[1] / float(img.shape[0]) for img in padded_img_list]
 
         # Sorting can speed up the recognition process
         indices = np.argsort(np.array(width_list))
 
-        img_num = len(img_list)
         rec_res = [("", 0.0)] * img_num
-
-        batch_num = self.text_recognizer.rec_batch_num
-        with tqdm(total=img_num, desc=tqdm_desc, disable=not tqdm_enable) as pbar:
-            index = 0
+        ratio_cap = OCR_REC_MAX_WH_RATIO
+        with tqdm(total=real_img_num, desc=tqdm_desc, disable=not tqdm_enable) as pbar:
             elapse = 0
             for beg_img_no in range(0, img_num, batch_num):
                 end_img_no = min(img_num, beg_img_no + batch_num)
 
                 # Parameter Alignment for PaddleOCR
-                imgC, imgH, imgW = self.text_recognizer.rec_image_shape[:3]
-                max_wh_ratio = imgW / imgH
                 wh_ratio_list = []
                 for ino in range(beg_img_no, end_img_no):
-                    h, w = img_list[indices[ino]].shape[0:2]
-                    wh_ratio = w * 1.0 / h
-                    max_wh_ratio = max(max_wh_ratio, wh_ratio)
-                    wh_ratio_list.append(wh_ratio)
+                    h, w = padded_img_list[indices[ino]].shape[0:2]
+                    wh_ratio_list.append(w * 1.0 / h)
+
+                # Keep the padded width fixed across batches: a changing width
+                # makes the executor retain one large buffer per shape and
+                # eventually loses the device on a long document.
+                max_wh_ratio = ratio_cap
 
                 norm_img_batch = []
                 for ino in range(beg_img_no, end_img_no):
-                    norm_img = self.text_recognizer.resize_norm_img(img_list[indices[ino]], max_wh_ratio)
+                    norm_img = self.text_recognizer.resize_norm_img(padded_img_list[indices[ino]], max_wh_ratio)
                     norm_img_batch.append(norm_img[np.newaxis, :])
                 norm_img_batch = np.concatenate(norm_img_batch).astype(np.float32)
 
@@ -502,11 +530,11 @@ class RapidOcrModel(object):
                     rec_res[indices[beg_img_no + rno]] = (one_res, None)
                 elapse += time.perf_counter() - start_time
 
-                # 更新进度条，每次增加batch_size，但要注意最后一个batch可能不足batch_size
-                current_batch_size = min(batch_num, img_num - index * batch_num)
-                index += 1
-                pbar.update(current_batch_size)
+                pbar.update(min(batch_num, max(0, real_img_num - beg_img_no)))
 
+            # Drop padded dummy results; real crops are always the first
+            # `real_img_num` entries because padding was appended.
+            rec_res = rec_res[:real_img_num]
             all_line_results, all_word_results = list(zip(*rec_res))
             txts, scores = list(zip(*all_line_results))
         return TextRecOutput(

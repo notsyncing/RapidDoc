@@ -131,7 +131,12 @@ class RapidTableModel(object):
         # separate CPU/ONNX OCR instance for rare numeric-cell repairs; reusing
         # the GPU session here can corrupt the GPU plugin state.
         if hasattr(table_structure, "refine_ocr_engine"):
-            table_structure.refine_ocr_engine = None
+            # Numeric-cell repair used to lazily construct a second
+            # RapidOcrModel(), which on MINERU_DEVICE_MODE=openvino_gpu became
+            # a second GPU OCR engine with dynamic batch/width shapes.  Reuse
+            # the already shape-stabilised main OCR engine instead; table
+            # inference is serial, so this does not overlap its use.
+            table_structure.refine_ocr_engine = self.ocr_engine
         if self.enable_blank_cell_rec and hasattr(table_structure, "ocr_engine"):
             table_structure.ocr_engine = self.ocr_engine
         if os.getenv("RAPID_DOC_TABLE_BLANK_REC") == "1" and hasattr(table_structure, "ocr_engine"):

@@ -241,12 +241,10 @@ class UnetTableRecognition:
         if os.getenv("RAPID_DOC_DISABLE_NUMERIC_REFINE") == "1":
             return t_rec_ocr_list
         if self.refine_ocr_engine is None:
-            try:
-                from rapid_doc.model.ocr.rapid_ocr import RapidOcrModel
-                self.refine_ocr_engine = RapidOcrModel()
-            except Exception as exc:
-                logger.warning(f"Table numeric cell OCR init failed: {exc}")
-                return t_rec_ocr_list
+            # Never create a second GPU OCR engine here.  The table model
+            # attaches the shape-stabilised main OCR engine; without it,
+            # skipping the optional repair is safer than a hidden GPU compile.
+            return t_rec_ocr_list
         # Re-OCR is only a repair path for a handful of wrapped numbers. Very
         # large grids (scanned financial tables) can contain hundreds of
         # suspicious cells; re-running detection per cell is both slow and

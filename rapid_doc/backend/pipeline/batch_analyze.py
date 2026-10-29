@@ -551,7 +551,10 @@ class BatchAnalyze:
                     scores = [float(r[1]) if isinstance(r, (list, tuple)) else 0.0 for r in recs]
                     pk['ocr_result'] = [dt_boxes, texts, scores]
                 else:
-                    pk['ocr_result'] = []
+                    # Keep the 3-list OCR contract even when recognition
+                    # produced nothing: downstream batched table inference
+                    # indexes boxes/texts/scores and must not see [].
+                    pk['ocr_result'] = [[], [], []]
 
         # Phase 2: batched model inference grouped by wired/wireless
         _run_batched_table_inference(self.table_config, batch_entries)
@@ -587,6 +590,7 @@ class BatchAnalyze:
                     seal_ocr_model = atom_model_manager.get_atom_model(
                         atom_model_name=AtomicModel.OCR,
                         is_seal=True,
+                        ocr_config=self.ocr_config,
                     )
                 seal_ocr_res = seal_ocr_model.ocr(seal_crop_bgr, det=True, rec=True)[0]
                 if not seal_ocr_res:

@@ -25,6 +25,7 @@ from rapid_doc.utils.draw_bbox import draw_layout_bbox, draw_span_bbox
 from rapid_doc.utils.empty_office import normalize_empty_office_bytes
 from rapid_doc.utils.enum_class import MakeMode
 from rapid_doc.utils.config_reader import get_processing_window_size
+from rapid_doc.utils.gpu_lock import doc_workers
 from rapid_doc.utils.guess_suffix_or_lang import guess_suffix_by_bytes
 from rapid_doc.utils.pdf_image_tools import images_bytes_to_pdf_bytes
 
@@ -91,11 +92,79 @@ class RapidDoc:
         image_output_mode: str = "url", # url / data_uri
         preload_model: bool = False,
         pdf_pages_batch: int = 64,
+        inference_engine: str | None = None,
+        sycl_device: str = "GPU",
     ) -> None:
         self.layout_config = layout_config or {}
         self.ocr_config = ocr_config or {}
         self.formula_config = formula_config or {}
         self.table_config = table_config or {}
+
+        # In-process sycl-infer routing: every model family uses the local
+        # libsycl_infer_onnx executor on `sycl_device` (GPU by default).
+        engine = inference_engine or os.getenv("RAPID_DOC_ENGINE")
+        if engine and str(engine).lower().replace("-", "_") in (
+                "sycl_infer", "sycl_infer_onnx"):
+            from rapid_doc.model.formula.rapid_formula_self import EngineType as FormulaEngine
+            from rapid_doc.model.layout.rapid_layout_self import EngineType as LayoutEngine
+            from rapid_doc.model.table.rapid_table_self import EngineType as TableEngine
+
+            self.layout_config = dict(self.layout_config)
+            self.layout_config["engine_type"] = LayoutEngine.SYCL_INFER
+            self.layout_config["engine_cfg"] = {
+                **dict(self.layout_config.get("engine_cfg") or {}),
+                "device": sycl_device,
+                # The detector's third output is the instance-mask stack,
+                # [N, 200, 200] int32 - 48 MB for a page and 768 MB for a
+                # 16-page batch.  The pipeline immediately truncates every
+                # mask to a byte (`mask.astype(np.uint8)`, then its contours),
+                # so the device casts it and 4x fewer bytes cross the bus.
+                # Values are 0/1, so the byte is exact.
+                "output_modes": ({"2": "u8"}
+                                 if os.getenv("RAPID_DOC_LAYOUT_MASK_U8", "1") != "0" else {}),
+            }
+            self.formula_config = dict(self.formula_config)
+            self.formula_config["engine_type"] = FormulaEngine.SYCL_INFER
+            self.formula_config["engine_cfg"] = {
+                **dict(self.formula_config.get("engine_cfg") or {}),
+                "device": sycl_device,
+            }
+            self.table_config = dict(self.table_config)
+            self.table_config["engine_type"] = TableEngine.SYCL_INFER
+            self.table_config["engine_cfg"] = {
+                **dict(self.table_config.get("engine_cfg") or {}),
+                "device": sycl_device,
+            }
+            self.ocr_config = dict(self.ocr_config)
+            self.ocr_config["engine_type"] = "sycl_infer"
+            self.ocr_config["sycl_device"] = sycl_device
+            # The OCR pipeline chooses its batching path from Det/Rec.device.
+            # Keep RapidOCR's own device selection alone (it is replaced after
+            # construction) but tell the batcher this is a GPU session.
+            self.ocr_config["sycl_infer"] = True
+
+            # A770 (16 GB) batch budget for the in-process executor.  These are
+            # conservative defaults; an explicit env value still wins.
+            for k, v in {
+                # Batched layout is correct: the sycl-infer ONNX executor's
+                # int64 Transpose (the source of the detector's `orders`
+                # column) used column-major output indexing, which is an
+                # identity only at batch=1.  Fixed in sycl-infer and covered
+                # by tests/test_sycl_layout_batch.py.  16 is the measured
+                # full-pipeline safe maximum: one 16-page group uses 6.2 GB
+                # RSS and runs the 138-page report in 319 s.  24 is unstable
+                # with all twelve models resident - one 138-page run
+                # succeeded, another failed after the layout with
+                # UR_RESULT_ERROR_OUT_OF_RESOURCES - so 16 is the default.
+                "RAPID_DOC_LAYOUT_BATCH_SIZE": "16",
+                "RAPID_DOC_OCR_DET_BATCH_SIZE": "32",
+                "RAPID_DOC_OCR_REC_BATCH_SIZE": "128",
+                "RAPID_DOC_TABLE_STRUCTURE_BATCH_SIZE": "64",
+                "RAPID_DOC_TABLE_REC_BATCH_SIZE": "32",
+                "RAPID_DOC_FORMULA_BATCH_SIZE": "32",
+                "RAPID_DOC_OCR_MAX_WH_RATIO": "8",
+            }.items():
+                os.environ.setdefault(k, v)
         self.checkbox_config = checkbox_config or {}
         self.image_config = image_config or {}
 
@@ -162,6 +231,61 @@ class RapidDoc:
     ) -> RapidDocOutput | list[RapidDocOutput]:
         is_batch = self._is_batch_input(inputs)
         normalized_inputs = list(inputs) if is_batch else [inputs]
+
+        # Concurrent documents: the pipeline alternates device calls and host
+        # work (crops, table assembly, middle-json, rendering, file writes).
+        # With one document the device idles through the host half; the
+        # device work of one document fills the host half of another.  Each
+        # document keeps the same call sequence and batch shapes, so the
+        # per-document output is unchanged; only the model entry points are
+        # serialised (rapid_doc.utils.gpu_lock).
+        if is_batch and len(normalized_inputs) > 1:
+            workers = min(doc_workers(), len(normalized_inputs))
+            if workers > 1:
+                from concurrent.futures import ThreadPoolExecutor
+                doc_results: list = [None] * len(normalized_inputs)
+
+                def _run_one(index: int) -> None:
+                    doc_results[index] = self(
+                        normalized_inputs[index],
+                        output_dir=output_dir,
+                        image_writer=image_writer,
+                        md_writer=md_writer,
+                        image_output_mode=image_output_mode,
+                        image_dir_name=image_dir_name,
+                        parse_method=parse_method,
+                        formula_enable=formula_enable,
+                        table_enable=table_enable,
+                        lang=lang[index] if isinstance(lang, list) else lang,
+                        start_page_id=start_page_id,
+                        end_page_id=end_page_id,
+                        f_dump_middle_json=f_dump_middle_json,
+                        f_dump_content_list=f_dump_content_list,
+                        f_draw_layout_bbox=f_draw_layout_bbox,
+                        f_draw_span_bbox=f_draw_span_bbox,
+                    )
+
+                # Longest first: a document's windows are independent of the
+                # others, and with a fixed worker count the makespan is set by
+                # the last long document to start.  The file size is the only
+                # document property available before parsing and is monotone
+                # with the page count on this corpus.
+                def _input_bytes(index: int) -> int:
+                    item = normalized_inputs[index]
+                    try:
+                        if isinstance(item, (str, os.PathLike)):
+                            return os.path.getsize(item)
+                        if isinstance(item, (bytes, bytearray)):
+                            return len(item)
+                    except OSError:
+                        pass
+                    return 0
+
+                order = sorted(range(len(normalized_inputs)),
+                               key=_input_bytes, reverse=True)
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    list(pool.map(_run_one, order))
+                return doc_results
 
         final_image_output_mode = image_output_mode or self.image_output_mode
         final_image_dir_name = image_dir_name or self.image_dir_name

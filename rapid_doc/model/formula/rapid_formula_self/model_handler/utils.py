@@ -25,7 +25,12 @@ class ModelProcessor:
 
     @classmethod
     def get_single_model_path(cls, model_type: ModelType, engine_type: EngineType) -> str:
-        model_info = cls.model_map[engine_type.value][model_type.value]
+        # An in-process engine (sycl-infer) uses the ONNX file; it has no
+        # entry of its own in the download table.
+        key = engine_type.value
+        if key not in cls.model_map:
+            key = "onnxruntime"
+        model_info = cls.model_map[key][model_type.value]
         save_model_path = (
             cls.DEFAULT_MODEL_DIR / Path(model_info["model_dir_or_path"]).name
         )
@@ -41,7 +46,10 @@ class ModelProcessor:
 
     @classmethod
     def get_character_path(cls, model_type: ModelType, engine_type: EngineType) -> str:
-        model_info = cls.model_map[engine_type.value][model_type.value]
+        key = engine_type.value
+        if key not in cls.model_map:
+            key = "onnxruntime"
+        model_info = cls.model_map[key][model_type.value]
         dict_download_url = model_info.get("dict_url")
         save_model_path = (
             cls.DEFAULT_MODEL_DIR / Path(dict_download_url).name

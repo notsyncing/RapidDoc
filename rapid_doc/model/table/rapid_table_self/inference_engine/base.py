@@ -76,4 +76,9 @@ def get_engine(engine_type: EngineType):
 
         return OpenVINOInferSession
 
+    if engine_type == EngineType.SYCL_INFER:
+        from rapid_doc.model.sycl_infer_onnx import SyclInferSession
+
+        return SyclInferSession
+
     raise ValueError(f"Unsupported engine: {engine_type.value}")

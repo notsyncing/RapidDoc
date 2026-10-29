@@ -53,6 +53,53 @@ class ModelSingleton:
         return self._models[key]
 
 
+def _apply_engine_env(layout_config, ocr_config, formula_config, table_config):
+    """Route every model family to the in-process sycl-infer executor.
+
+    The Python API selects this with ``RapidDoc(inference_engine=...)``, but
+    the HTTP service and ``do_parse`` build ``ModelSingleton`` directly.  The
+    ``RAPID_DOC_ENGINE`` environment variable is the process-wide switch for
+    those entry points; an explicit engine in a caller's config is replaced,
+    matching ``RapidDoc.__init__``.
+    """
+    engine = str(os.getenv("RAPID_DOC_ENGINE", "")).lower().replace("-", "_")
+    if engine not in ("sycl_infer", "sycl_infer_onnx"):
+        return layout_config, ocr_config, formula_config, table_config
+
+    from ...model.layout.rapid_layout_self import EngineType as LayoutEngineType
+    from ...model.formula.rapid_formula_self import EngineType as FormulaEngineType
+    from ...model.table.rapid_table_self import EngineType as TableEngineType
+
+    device = os.getenv("SYCL_INFER_ONNX_DEVICE", "GPU")
+    layout_config = dict(layout_config or {})
+    ocr_config = dict(ocr_config or {})
+    formula_config = dict(formula_config or {})
+    table_config = dict(table_config or {})
+
+    layout_config["engine_type"] = LayoutEngineType.SYCL_INFER
+    layout_cfg = dict(layout_config.get("engine_cfg") or {})
+    layout_cfg.setdefault("device", device)
+    # The detector's third output is the [N, 200, 200] int32 mask stack.
+    if os.getenv("RAPID_DOC_LAYOUT_MASK_U8", "1") != "0":
+        layout_cfg.setdefault("output_modes", {"2": "u8"})
+    layout_config["engine_cfg"] = layout_cfg
+
+    formula_config["engine_type"] = FormulaEngineType.SYCL_INFER
+    formula_cfg = dict(formula_config.get("engine_cfg") or {})
+    formula_cfg.setdefault("device", device)
+    formula_config["engine_cfg"] = formula_cfg
+
+    table_config["engine_type"] = TableEngineType.SYCL_INFER
+    table_cfg = dict(table_config.get("engine_cfg") or {})
+    table_cfg.setdefault("device", device)
+    table_config["engine_cfg"] = table_cfg
+
+    ocr_config["engine_type"] = "sycl_infer"
+    ocr_config["sycl_device"] = device
+    ocr_config["sycl_infer"] = True
+    return layout_config, ocr_config, formula_config, table_config
+
+
 def custom_model_init(
     lang=None,
     formula_enable=True,
@@ -65,6 +112,10 @@ def custom_model_init(
     model_init_start = time.time()
     # 从配置文件读取model-dir和device
     device = get_device()
+
+    layout_config, ocr_config, formula_config, table_config = _apply_engine_env(
+        layout_config, ocr_config, formula_config, table_config
+    )
 
     final_formula_config = {"enable": formula_enable}
     if formula_config is not None:
@@ -309,6 +360,14 @@ def batch_image_analyze(
     from .batch_analyze import BatchAnalyze
 
     model_manager = ModelSingleton()
+
+    # The table model is built lazily from BatchAnalyze's config (after the
+    # native table route declines a table), so the engine selection has to be
+    # in these dicts before BatchAnalyze copies them, not only in
+    # custom_model_init.
+    layout_config, ocr_config, formula_config, table_config = _apply_engine_env(
+        layout_config, ocr_config, formula_config, table_config
+    )
 
     batch_ratio = 1
     device = get_device()

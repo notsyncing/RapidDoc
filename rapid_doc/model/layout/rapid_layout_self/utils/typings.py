@@ -155,6 +155,8 @@ class ModelType(Enum):
 class EngineType(Enum):
     ONNXRUNTIME = "onnxruntime"
     OPENVINO = "openvino"
+    # In-process sycl-infer ONNX executor (no server/subprocess).
+    SYCL_INFER = "sycl_infer"
 
 
 @dataclass

@@ -13,6 +13,7 @@ from ...model.table.rapid_table import RapidTableModel
 from ...model.docvortex_adapter import use_docvortex_table_rules
 from ...model.table.rapid_table_self import EngineType as TableEngineType
 from ...utils.hash_utils import make_hashable
+from rapid_doc.utils.gpu_lock import serialized
 
 def table_model_init(lang=None, ocr_config=None, table_config=None):
     ocr_config_clean = None
@@ -66,6 +67,7 @@ class AtomModelSingleton:
             cls._instance = super().__new__(cls)
         return cls._instance
 
+    @serialized
     def get_atom_model(self, atom_model_name: str, **kwargs):
         if atom_model_name in [AtomicModel.Layout]:
             key = (atom_model_name, make_hashable(kwargs.get('layout_config', None)))

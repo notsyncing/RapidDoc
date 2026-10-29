@@ -28,8 +28,8 @@ import multiprocessing
 
 
 DEFAULT_PDF_IMAGE_DPI = 200
-DEFAULT_MAX_PDF_RENDER_PROCESSES = 3
-DEFAULT_MIN_PAGES_PER_RENDER_PROCESS = 30
+DEFAULT_MAX_PDF_RENDER_PROCESSES = 8
+DEFAULT_MIN_PAGES_PER_RENDER_PROCESS = 4
 
 _pdf_render_executor = None
 _pdf_render_executor_lock = threading.Lock()

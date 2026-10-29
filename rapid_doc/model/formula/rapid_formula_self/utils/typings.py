@@ -20,6 +20,7 @@ class EngineType(Enum):
     ONNXRUNTIME = "onnxruntime"
     OPENVINO = "openvino"
     TORCH = "torch"
+    SYCL_INFER = "sycl_infer"
 
 
 @dataclass

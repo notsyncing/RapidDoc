@@ -87,6 +87,100 @@ result = parser("document.pdf")
 - **推理方式**
   - 默认 Pipeline 模型（OCR、版面、公式、表格）使用 ONNX Runtime，CPU/CUDA 按安装的 Runtime 和设备配置运行
   - OCR、公式等模块可显式配置其支持的其他引擎；原生 Office 和 DocVortex 规则解析不使用模型推理
+
+### 使用 sycl-infer 进程内 ONNX 引擎（GPU）
+
+`sycl-infer` 的 ONNX executor 可以编译成 `libsycl_infer_onnx`，由 RapidDoc
+直接加载；没有 HTTP 服务、没有子进程，张量留在本进程内，推理跑在
+`sycl_device` 指定的 SYCL 设备上。
+
+先构建库（在 sycl-infer 仓库）：
+
+```bash
+source /opt/intel/oneapi/setvars.sh
+cmake -S . -B build-rel2 -DCMAKE_BUILD_TYPE=Release -DSI_ONNX=ON
+cmake --build build-rel2 -j2 --target sycl_infer_onnx_c
+```
+
+然后让 RapidDoc 使用它：
+
+```bash
+export SYCL_INFER_ONNX_LIB="$PWD/../sycl-infer/build-rel2/libsycl_infer_onnx.so.1.0.0"
+export LD_LIBRARY_PATH="/opt/intel/oneapi/2026.2/lib:/opt/intel/oneapi/compiler/2026.2/lib:/opt/intel/oneapi/dnnl/2026.1/lib:$LD_LIBRARY_PATH"
+```
+
+```python
+from rapid_doc import RapidDoc
+
+parser = RapidDoc(
+    inference_engine="sycl-infer",   # 或 RAPID_DOC_ENGINE=sycl-infer
+    sycl_device="GPU",               # GPU / GPU.0 / CPU
+    parse_method="ocr",
+    formula_enable=True,
+    table_enable=True,
+)
+result = parser("document.pdf")
+```
+
+`inference_engine="sycl-infer"` 只改引擎选择；`layout_config`、`table_config`
+等仍可覆盖模型类型、阈值和 `docvortex_mode`。设备默认是 `GPU`，显式写
+`GPU.0` 可选多卡，`CPU` 在没有可用 GPU 或显存不足时使用。模型路径由
+RapidDoc 按原逻辑解析（本地 ONNX 文件），每个模型在第一次使用时加载并常驻。
+
+#### 单张 A770 的 batch 与实测
+
+在 16 GB A770 上，`error_pdfs` 的 12 份文档（957 页）全部跑通。
+`inference_engine="sycl-infer"` 会自动设置下列默认值（显式 env 可覆盖）：
+
+```bash
+export RAPID_DOC_LAYOUT_BATCH_SIZE=16       # 已修复 batch>1 的 orders 串页
+export RAPID_DOC_OCR_DET_BATCH_SIZE=32
+export RAPID_DOC_OCR_REC_BATCH_SIZE=128
+export RAPID_DOC_TABLE_STRUCTURE_BATCH_SIZE=64
+export RAPID_DOC_TABLE_REC_BATCH_SIZE=32
+export RAPID_DOC_FORMULA_BATCH_SIZE=32
+export RAPID_DOC_OCR_MAX_WH_RATIO=8         # 固定识别宽度，避免动态 shape 耗尽显存/打乱结果
+```
+
+**布局 batch 16**：sycl-infer ONNX executor 的 int64 `Transpose` 以前按
+列主序拆输出下标，batch=1 时恰好是恒等映射，batch>1 时会把 layout 模型的
+第 7 列 `orders` 复制/交错，导致阅读顺序挂到错误的框上。修复在
+`src/backend/onnx/ops_exec.cpp` 的 `exec_transpose`，回归测试为
+sycl-infer `test_onnx_batch` 和本仓库 `tests/test_sycl_layout_batch.py`。
+batch 1/2/4/16/17 逐页原始 boxes/order/masks 已核对；layout 1 与 16 的
+Markdown md5 在 600348、600275、601857 上完全一致。16 是 12 个模型
+常驻时的实测安全上限：24 不稳定（一次 138 页全流程成功，另一次在
+layout 之后报 OOR）。
+OCR 识别宽度固定为 `48 × 8`，否则一个超宽表格行会让 rec batch 分配数 GB
+并最终 `DEVICE_LOST`。表格 OCR 使用 32（固定宽度后稳定）。
+
+实测（单 A770，`GPU.0`，layout 16 / det 32 / rec 128 / table 64 / table-rec 32 /
+width 8 / formula 32，`error_pdfs` 全部 12 份，同一进程）：
+
+| | 页数 | 时间 | s/page | 峰值 RSS |
+|---|---:|---:|---:|---:|
+| 优化前 | 957 | 2335.1 s | 2.44 | 7.3 GiB |
+| **优化后** | 957 | **1262.4 s** | **1.319** | **4.2 GiB** |
+
+12/12 全部通过，无 OOM、无 device-lost，所有文档的 Markdown md5 与优化前
+一致（600348 / 600275 / 601857 / 002474 / 300408 逐一核对）。layout 1 与
+layout 16 在 600348 / 600275 / 601857 上的 Markdown md5 相同。17 页 600348
+的首屏输出已和 PDF 对照：标题、`一、重要提示`、两张表格和
+`二、主要财务数据` 的顺序一致。
+
+17 页 600348（warm）的阶段拆分：OCR rec **154 ms/page**（原 625）、OCR det
+**241**（原 613）、layout **115**（原 306）、table **214**（原 296）、
+PDF 渲染/后处理/Python **446**（原 490），合计 **1.17 s/page**（原 2.38）。
+收益来自 sycl-infer：识别输出的 [B,T,18710] 在设备上归约成 argmax/max、
+softmax 改成一行一个 work-group、1x1 卷积走 oneDNN matmul、卷积下标顺序
+按 depthwise/group-1 分别选择、layout mask 在设备上转成 uint8；以及
+table 批处理不再被一个 OCR 为空的表格整体打断。
+
+**仍未达到 1 s/page。** 957 页里模型时间 893 s（71%），最大单项是 SLANet
+（372 s，389 ms/page）：稀疏表格会按表重跑两个结构模型（batch 1，每次
+~0.6 s），把这次重试也成批会改变两张文档的 md5（002474/300408 实测），
+所以保留逐表。下一步是把 SLANet `Loop` 的 loop-carried 值留在设备上
+（每次迭代目前仍由 host 分发 ~160 个算子、27 次）。
 ---
 
 ## 基准测试结果

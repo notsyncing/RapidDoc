@@ -86,6 +86,12 @@ class RapidOcrModel(object):
 
         # 获取用户传入的 engine_type
         engine_type = ocr_config.get('engine_type') if ocr_config else None
+        # sycl-infer is an in-process ONNX executor, not one of rapidocr's
+        # engine enums.  RapidOCR still resolves the model paths and the
+        # character dict; the det/rec sessions are replaced after it builds
+        # them.
+        sycl_engine = str(engine_type).lower().replace("-", "_") in ("sycl_infer", "sycl_infer_onnx")
+        sycl_device = (ocr_config or {}).get("sycl_device", "GPU")
         rapid_doc_dir = Path(os.path.abspath(__file__)).parent.parent.parent
         # CPU 上优先使用 OpenVINO（如果可用且用户未指定 engine_type）
         if device.startswith('cpu') and check_openvino() and not engine_type:
@@ -106,6 +112,10 @@ class RapidOcrModel(object):
         # 如果传入了 ocr_config，则覆盖参数
         if ocr_config is not None:
             for key, value in ocr_config.items():
+                # The sycl_* keys and engine_type are RapidDoc's routing
+                # controls, not rapidocr parameters.
+                if key.startswith("sycl_") or key == "engine_type":
+                    continue
                 default_params[key] = value
 
         if device.startswith('cuda'):
@@ -204,10 +214,23 @@ class RapidOcrModel(object):
             load_model = getattr(self.ocr_engine, f"_load_{task}_model", None)
             if callable(load_model) and getattr(self.ocr_engine, f"text_{task}", None) is None:
                 load_model()
-        self.onnx_ops_reports = install_onnx_ops(self.ocr_engine, onnx_ops_settings)
-        if self.onnx_ops_reports:
-            for task, report in self.onnx_ops_reports.items():
-                logger.info("OCR {} ONNX ops: {}", task, report)
+        if sycl_engine:
+            from rapid_doc.model.sycl_infer_onnx import attach_sycl_sessions
+
+            self.onnx_ops_reports = {}
+            attach_sycl_sessions(
+                self.ocr_engine,
+                default_params["Det.model_path"],
+                default_params["Rec.model_path"],
+                device=str(sycl_device).upper(),
+                det_drops=(ocr_config or {}).get("sycl_det_drop_outputs"),
+                rec_drops=(ocr_config or {}).get("sycl_rec_drop_outputs"),
+            )
+        else:
+            self.onnx_ops_reports = install_onnx_ops(self.ocr_engine, onnx_ops_settings)
+            if self.onnx_ops_reports:
+                for task, report in self.onnx_ops_reports.items():
+                    logger.info("OCR {} ONNX ops: {}", task, report)
         self.text_detector = self.ocr_engine.text_det
         self.text_recognizer = self.ocr_engine.text_rec
         self.rec_batch_num = self.text_recognizer.rec_batch_num

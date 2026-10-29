@@ -16,6 +16,7 @@ class EngineType(Enum):
     ONNXRUNTIME = "onnxruntime"
     TORCH = "torch"
     OPENVINO = "openvino"
+    SYCL_INFER = "sycl_infer"
 
 class ModelType(Enum):
     SLANETPLUS = "slanet_plus"

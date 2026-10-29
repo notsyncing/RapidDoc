@@ -166,15 +166,16 @@ class MineruPipelineModel:
             table_cfg.setdefault('performance_hint', 'THROUGHPUT')
             table_cfg.setdefault('performance_num_requests', 4)
 
-            # Enable OpenVINO GPU cache
-            try:
+            # Persistent GPU blob caching is opt-in.  A stale/interrupted cache
+            # blob makes the plugin return empty OCR detections without an
+            # error; the in-memory shape cache keeps runtime performance.
+            from ...utils.openvino_core import get_gpu_cache_dir
+            cache_dir = get_gpu_cache_dir()
+            if cache_dir:
                 import os
-                cache_dir = os.path.join(os.path.expanduser('~'), '.cache', 'openvino_gpu_cache')
                 os.makedirs(cache_dir, exist_ok=True)
                 layout_cfg.setdefault('cache_dir', cache_dir)
                 table_cfg.setdefault('cache_dir', cache_dir)
-            except Exception:
-                pass
 
         logger.info(
             'DocAnalysis init, this may take some times......'

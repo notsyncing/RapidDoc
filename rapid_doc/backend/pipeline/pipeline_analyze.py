@@ -354,17 +354,16 @@ def batch_image_analyze(
         table_cfg.setdefault('performance_hint', 'THROUGHPUT')
         table_cfg.setdefault('performance_num_requests', 4)
 
-        # Enable OpenVINO GPU model cache to skip JIT on restart. Do this via
-        # compile config only: a second ov.Core() creates a separate GPU plugin
-        # instance and can invalidate the shared long-lived Core's context.
-        try:
-            cache_dir = os.path.join(os.path.expanduser('~'), '.cache', 'openvino_gpu_cache')
+        # The persistent GPU blob cache is opt-in: a stale or partially written
+        # blob makes the plugin return empty OCR detections (see
+        # openvino_core.get_gpu_cache_dir).  In-memory shape buckets remain.
+        from ...utils.openvino_core import get_gpu_cache_dir
+        cache_dir = get_gpu_cache_dir()
+        if cache_dir:
             os.makedirs(cache_dir, exist_ok=True)
             layout_cfg.setdefault('cache_dir', cache_dir)
             table_cfg.setdefault('cache_dir', cache_dir)
             logger.info(f'OpenVINO GPU cache dir: {cache_dir}')
-        except Exception:
-            pass
 
         # batch_ratio 固定为 1：OpenVINO 各模型的输入张量和激活池都随
         # batch 线性增长并驻留，放大 batch 会同步放大整条 GPU 管线的

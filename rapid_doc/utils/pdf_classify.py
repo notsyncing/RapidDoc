@@ -356,7 +356,16 @@ def _sparse_page_ocr_reason(pdf_doc, sample):
         # Textless pages also inspect vector objects: outlined text still needs
         # OCR, whereas genuinely empty pages should not condemn a text document.
         filters = [pdfium_c.FPDF_PAGEOBJ_IMAGE] if sample["cleaned_text"] else None
-        for obj in page.get_objects(filter=filters, max_depth=3):
+        # Materialise before closing anything: pypdfium2's get_objects()
+        # descends into Form XObjects lazily, after yielding the form object.
+        # Closing a yielded form (raw handle cleared) and then resuming the
+        # generator makes it recurse with a NULL pageobject, raising
+        # "argument 1: TypeError: expected LP_struct_fpdf_pageobject_t__
+        # instance instead of NoneType".  With filter=None a textless page
+        # exposes that path on every nested form.
+        with pdfium_guard():
+            objects = list(page.get_objects(filter=filters, max_depth=3))
+        for obj in objects:
             try:
                 box = _intersect(_get_pdfium_page_object_bounds(obj), frame)
                 if _area(box):
@@ -1224,6 +1233,8 @@ def get_high_image_coverage_ratio_pdfium(pdf_doc, page_indices):
             page = None
             try:
                 page = pdf_doc[page_index]
+                if page is None:
+                    continue
                 page_bbox = page.get_bbox()
                 page_area = abs(
                     (page_bbox[2] - page_bbox[0]) * (page_bbox[3] - page_bbox[1])
@@ -1233,6 +1244,12 @@ def get_high_image_coverage_ratio_pdfium(pdf_doc, page_indices):
                 for page_object in page.get_objects(
                     filter=[pdfium_c.FPDF_PAGEOBJ_IMAGE], max_depth=3
                 ):
+                    # Some malformed PDFs yield a null page object; closing or
+                    # measuring it raises a ctypes TypeError and turns a
+                    # classification request into a 500. Ignore that object and
+                    # continue with the remaining pages.
+                    if page_object is None:
+                        continue
                     try:
                         left, bottom, right, top = _get_pdfium_page_object_bounds(
                             page_object
@@ -1247,7 +1264,8 @@ def get_high_image_coverage_ratio_pdfium(pdf_doc, page_indices):
                 if coverage_ratio >= HIGH_IMAGE_COVERAGE_THRESHOLD:
                     high_image_coverage_pages += 1
             finally:
-                close_pdfium_child(page)
+                if page is not None:
+                    close_pdfium_child(page)
 
     if not page_indices:
         return 0.0

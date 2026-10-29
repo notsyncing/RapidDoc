@@ -823,6 +823,7 @@ def _parse_table_config(table_config):
 def _run_batched_table_inference(table_config, batch_data: List[tuple]):
     """对一批预处理后的表格执行分组 batch 推理。"""
     from ...model.table.rapid_table_self import ModelType
+    from ...model.table.rapid_table_self.utils import normalize_ocr_result
     from ...model.table.utils import select_best_table_model
 
     if not batch_data:
@@ -837,6 +838,20 @@ def _run_batched_table_inference(table_config, batch_data: List[tuple]):
         model = getattr(entries[0][1], attr_name, None)
         if model is None:
             return [e[1].predict(**e[2]) for e in entries]
+
+        # RapidTable's matcher requires [boxes, texts, scores] per image and
+        # indexes all three.  A table whose OCR found nothing arrives as []
+        # (deferred OCR produced no text, or detection found no box).  That
+        # one entry used to abort the *whole* batch with IndexError.  Normalise
+        # every entry to the 3-list contract here instead of dropping it from
+        # the batch: empty tables must keep the static batch shape, otherwise
+        # the GPU plugin recompiles (and a per-table fallback defeats the
+        # batched decoder entirely).
+        ocrs = []
+        for e in entries:
+            ocr = normalize_ocr_result(e[2].get('ocr_result'))
+            e[2]['ocr_result'] = ocr
+            ocrs.append(ocr)
         # RapidTable receives raw ndarrays without color conversion, while
         # the single-table path (RapidTableModel.predict) converts RGB to
         # BGR. The pipeline stores table crops as RGB, so batch inference
@@ -848,7 +863,6 @@ def _run_batched_table_inference(table_config, batch_data: List[tuple]):
             if img.ndim == 3 and img.shape[2] == 3:
                 img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             imgs.append(img)
-        ocrs = [e[2]['ocr_result'] for e in entries]
         n_real = len(imgs)
         model_kind = str(getattr(getattr(model, 'cfg', None), 'model_type', '')).lower()
         if 'unet' in model_kind:

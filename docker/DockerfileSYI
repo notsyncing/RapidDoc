@@ -2,8 +2,10 @@
 #
 # This image differs from DockerfileOpenVINO in two ways:
 #   * the inference engine is libsycl_infer_onnx from the sycl-infer wheel;
-#   * every document-parsing stage is pinned to batch size 1, so the shared
-#     Intel iGPU (and the host RAM it borrows) stays inside a small budget.
+#   * the API coalesces concurrent /file_parse requests into one internal
+#     RapidDoc batch, so one GPU pipeline serves the whole burst instead of
+#     several independent pipelines contending for the same card.  The batch
+#     sizes below are the measured A770 defaults, not batch 1.
 #
 # The wheel is built by sycl-infer's ci/Jenkinsfile.  GitHub rejects files over
 # 100 MB and warns above 50 MB, so the wheel is stored as <= 50 MB volumes plus
@@ -94,6 +96,28 @@ RUN SYCL_LIB_DIR="$(python3 -c 'import pathlib, sycl_infer; print(pathlib.Path(s
     ldconfig && \
     test -f /usr/local/lib/libsycl_infer_onnx.so.1
 
+# The Python wheel carries libsycl/oneDNN but not the Unified Runtime loader,
+# its Level Zero adapters or UMF, so install the matching oneAPI runtime from
+# Intel's apt repository.  This is runtime-only: no compiler toolchain, and
+# nothing is copied from the host.  2026.1.1 matches the wheel's libsycl.so.9
+# (libur_loader 0.12); a newer runtime is not assumed to be ABI-compatible.
+RUN curl -fsSL https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+        | gpg --dearmor -o /usr/share/keyrings/oneapi-archive-keyring.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+        > /etc/apt/sources.list.d/oneAPI.list && \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends \
+        libhwloc15 \
+        intel-oneapi-runtime-dpcpp-sycl-core=2026.1.1-325 \
+        intel-oneapi-umf-1.2 \
+        intel-oneapi-runtime-tbb && \
+    echo /opt/intel/oneapi/redist/lib > /etc/ld.so.conf.d/oneapi-runtime.conf && \
+    echo /opt/intel/oneapi/umf/1.2/lib >> /etc/ld.so.conf.d/oneapi-runtime.conf && \
+    ldconfig && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    test -f /opt/intel/oneapi/redist/lib/libur_loader.so.0
+ENV UR_ADAPTERS_SEARCH_PATH=/opt/intel/oneapi/redist/lib
+
 # Install the patched rapid-doc wheel + its API extras.  onnxruntime is not
 # used by the sycl path, but several RapidDoc/RapidOCR modules import it as a
 # fallback; keeping it installed makes those imports non-fatal.
@@ -123,14 +147,18 @@ RUN python3 download_models.py
 # pipeline through ModelSingleton, so this env is what selects the engine
 # (rapid_doc/backend/pipeline/pipeline_analyze.py::_apply_engine_env).
 ENV RAPID_DOC_ENGINE=sycl-infer \
-    SYCL_INFER_ONNX_DEVICE=GPU \
+    SYCL_INFER_ONNX_DEVICE=GPU.0 \
     SYCL_INFER_ONNX_LIB=/usr/local/lib/libsycl_infer_onnx.so.1
 
 # A770 single-card defaults, measured on the 957-page error_pdfs corpus:
-# 0.73 s/page at six document workers with the batch sizes below.  The
-# per-document workers overlap host render/post with the shared in-order GPU
+# six document workers overlap host render/post with the shared in-order GPU
 # queue; the layout/OCR/table batch sizes stay inside the 16 GB card.
 # Explicit env wins, so a smaller-memory deployment can still set batches to 1.
+#
+# The HTTP layer waits one short window for concurrent uploads and merges the
+# same-configuration requests into one RapidDoc batch.  The defaults fit the
+# whole 12-document corpus (957 pages) in one batch while bounding a single
+# upload; a larger request is split at these limits.
 ENV RAPID_DOC_LAYOUT_BATCH_SIZE=16 \
     RAPID_DOC_OCR_DET_BATCH_SIZE=32 \
     RAPID_DOC_OCR_REC_BATCH_SIZE=128 \
@@ -142,7 +170,15 @@ ENV RAPID_DOC_LAYOUT_BATCH_SIZE=16 \
     RAPID_DOC_PAGE_BATCH_SIZE=24 \
     RAPID_DOC_OCR_MAX_WH_RATIO=8 \
     RAPID_DOC_DOC_WORKERS=6 \
-    RAPID_DOC_API_CONCURRENCY=3 \
+    RAPID_DOC_API_CONCURRENCY=1 \
+    RAPID_DOC_API_BATCH=1 \
+    RAPID_DOC_API_BATCH_MAX_FILES=16 \
+    RAPID_DOC_API_BATCH_MAX_PAGES=1200 \
+    RAPID_DOC_API_BATCH_WINDOW_MS=100 \
+    RAPID_DOC_API_BATCH_MAX_WINDOW_MS=1000 \
+    RAPID_DOC_API_REQUEST_TIMEOUT_S=1800 \
+    RAPID_DOC_API_QUEUE_MAX=64 \
+    SYCL_INFER_TRIM_MB=64 \
     MINERU_PROCESSING_WINDOW_SIZE=64
 
 EXPOSE 8888 8888

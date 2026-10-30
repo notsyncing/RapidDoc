@@ -139,3 +139,22 @@ curl -X POST "http://localhost:8888/file_parse" \
 2. **功能完整**: 支持所有官方后端和解析选项
 3. **结果一致**: 输出格式与官方 API 保持一致
 4. **性能优化**: 利用官方优化的解析逻辑
+
+## 并发 batch 合并
+
+多个并发的 `/file_parse` 请求会在服务端合并成一次 RapidDoc batch：
+
+1. 请求进入队列后返回一个 future，dispatcher 在 100 ms 窗口内收集**相同配置**的请求；
+2. 文件写入同一个 batch 输出目录，内部文件名带唯一前缀，避免同名覆盖；
+3. batch 由 `RAPID_DOC_DOC_WORKERS` 个文档线程执行（默认 6），每个请求读取自己的
+   md / middle_json / content_list / images，再构造原来的 JSON 或 zip 响应；
+4. batch 完成后统一清理；`clear_output_file=false`、非 PDF、`return_model_output`、
+   自定义模型等请求回退到独立执行；
+5. 单次 batch 受 `RAPID_DOC_API_BATCH_MAX_FILES`（默认 16）、
+   `RAPID_DOC_API_BATCH_MAX_PAGES`（默认 1200）限制，超出拆批；请求硬超时
+   `RAPID_DOC_API_REQUEST_TIMEOUT_S`（默认 1800 s），超时返回 504。
+
+公式模型同样走 sycl-infer（`RAPID_DOC_FORMULA_ENGINE` 未设置即 sycl；不要再设成
+`onnxruntime`/`cpu`）。实测 3 路并发 12 份 957 页总 wall 约 696.2 s，单请求 12 份
+约 695.5 s，12/12 HTTP 200，两者同一文档 md5 一致；formula 的 sycl 输出与
+ONNXRuntime 在同一输入上逐元素一致（max|diff| = 0）。

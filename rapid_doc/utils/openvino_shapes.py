@@ -112,6 +112,15 @@ REC_WIDTH_BUCKETS = (
 # text recogniser's built-in parameter alignment.
 OCR_REC_DEFAULT_WIDTH = 320
 OCR_REC_MAX_BATCH = _env_positive_int("RAPID_DOC_OCR_REC_BATCH_SIZE", 64)
+# The fixed-shape recogniser path (rapid_ocr.py) pads every batch to
+# OCR_REC_BATCH and every crop to OCR_REC_MAX_WH_RATIO.  The symbols were
+# removed when the bucketed path landed but are still imported by the tuned
+# recogniser, so restore them here with the image's measured defaults.
+OCR_REC_BATCH = _env_positive_int("RAPID_DOC_OCR_REC_BATCH_SIZE", 128)
+try:
+    OCR_REC_MAX_WH_RATIO = float(os.getenv("RAPID_DOC_OCR_MAX_WH_RATIO", "8"))
+except (TypeError, ValueError):
+    OCR_REC_MAX_WH_RATIO = 8.0
 # The CTC output is [batch, width/4, vocab] float32 (~18.7k classes for
 # PP-OCRv6).  A batch of 64 at width 2560 would materialise ~3 GB, and the
 # runner copies it once more for the caller.  Limit the batch by the output
@@ -240,6 +249,16 @@ def pad_det_to_shape(img: np.ndarray, height: int, width: int):
 def pad_det_to_square(img: np.ndarray, canvas: int):
     """Compatibility helper: pad to a square detector canvas."""
     return pad_det_to_shape(img, canvas, canvas)
+
+
+def det_canvas_size(height: int, width: int) -> int:
+    """Square detector canvas for the fixed-shape recognition path."""
+    return det_square_bucket(max(int(height), int(width)))
+
+
+def pad_det_to_canvas(img: np.ndarray, canvas: int):
+    """Square detection canvas, named for the fixed-shape recogniser path."""
+    return pad_det_to_square(img, canvas)
 
 
 # ---------------------------------------------------------------------------

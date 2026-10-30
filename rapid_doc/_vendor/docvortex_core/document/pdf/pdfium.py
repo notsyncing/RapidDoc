@@ -1,5 +1,4 @@
 import os
-import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -7,9 +6,15 @@ from typing import Any, Iterator, Sequence, TypeVar
 
 from loguru import logger
 
+from rapid_doc.utils import PyPDFium2Parser
+
 from .font_runtime import PdfiumFontError, PdfiumRuntimeInfo, _FontProvider
 
-_pdfium_lock = threading.RLock()
+# PDFium is a process-global library.  DocVortex used its own RLock while the
+# rest of the pipeline guarded pypdfium2 with PyPDFium2Parser.lock, so six
+# document workers could enter the native library through two different
+# locks and crash (SIGSEGV in _open_page/close).  Share the one lock.
+_pdfium_lock = PyPDFium2Parser.lock
 _font_provider: _FontProvider | None = None
 
 T = TypeVar("T")

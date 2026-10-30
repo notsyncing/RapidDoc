@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+from loguru import logger
 from rapid_doc.utils.gpu_lock import doc_workers, serialized_per_instance
 
 __all__ = [
@@ -530,6 +531,10 @@ def attach_sycl_sessions(ocr_engine, det_path: str, rec_path: str, *,
                  if os.getenv("RAPID_DOC_REC_ARGMAX", "1") != "0" else {})
     ocr_engine.text_rec.session = SyclOcrSession(
         cfg(rec_path, rec_drops, rec_modes), characters=characters)
+    # RapidOCR constructs its own ONNX Runtime sessions before this function
+    # replaces det/rec; those log lines are construction-time only.  Say what
+    # the pipeline actually runs, so a log reader does not have to know that.
+    logger.info("[RapidOCR] Using engine_name: sycl_infer (det/rec attached)")
 
     # Keep the recogniser's padded width constant.  RapidOCR asks for a
     # per-batch max_wh_ratio; when a table cell is extremely wide the width,

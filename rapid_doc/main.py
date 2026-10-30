@@ -124,11 +124,22 @@ class RapidDoc:
                                  if os.getenv("RAPID_DOC_LAYOUT_MASK_U8", "1") != "0" else {}),
             }
             self.formula_config = dict(self.formula_config)
-            self.formula_config["engine_type"] = FormulaEngine.SYCL_INFER
-            self.formula_config["engine_cfg"] = {
-                **dict(self.formula_config.get("engine_cfg") or {}),
-                "device": sycl_device,
-            }
+            # Formula runs on the same sycl engine as every other stage.  The
+            # Loop now propagates a chained carried value's shape and bounds
+            # its body pool during the loop, so the 2 500-iteration decoder no
+            # longer reaches OUT_OF_DEVICE_MEMORY.  RAPID_DOC_FORMULA_ENGINE=
+            # onnxruntime remains only as an explicit A/B.
+            formula_engine = os.getenv("RAPID_DOC_FORMULA_ENGINE", "").lower()
+            if formula_engine in ("onnxruntime", "cpu"):
+                self.formula_config["engine_type"] = FormulaEngine.ONNXRUNTIME
+                self.formula_config["engine_cfg"] = dict(
+                    self.formula_config.get("engine_cfg") or {})
+            else:
+                self.formula_config["engine_type"] = FormulaEngine.SYCL_INFER
+                self.formula_config["engine_cfg"] = {
+                    **dict(self.formula_config.get("engine_cfg") or {}),
+                    "device": sycl_device,
+                }
             self.table_config = dict(self.table_config)
             self.table_config["engine_type"] = TableEngine.SYCL_INFER
             self.table_config["engine_cfg"] = {

@@ -84,11 +84,24 @@ def _apply_engine_env(layout_config, ocr_config, formula_config, table_config):
         layout_cfg.setdefault("output_modes", {"2": "u8"})
     layout_config["engine_cfg"] = layout_cfg
 
-    formula_config["engine_type"] = FormulaEngineType.SYCL_INFER
-    formula_cfg = dict(formula_config.get("engine_cfg") or {})
-    formula_cfg.setdefault("device", device)
-    formula_config["engine_cfg"] = formula_cfg
+    formula_engine = os.getenv("RAPID_DOC_FORMULA_ENGINE", "").lower()
+    if formula_engine in ("onnxruntime", "cpu"):
+        # Explicit A/B only.  The sycl formula Loop now carries the chained
+        # value's shape and bounds its body pool, so the default is sycl.
+        formula_config["engine_type"] = FormulaEngineType.ONNXRUNTIME
+        formula_config["engine_cfg"] = dict(formula_config.get("engine_cfg") or {})
+    else:
+        formula_config["engine_type"] = FormulaEngineType.SYCL_INFER
+        formula_cfg = dict(formula_config.get("engine_cfg") or {})
+        formula_cfg.setdefault("device", device)
+        formula_config["engine_cfg"] = formula_cfg
 
+    logger.info("[RapidFormula] Using engine_name: {}",
+                getattr(formula_config["engine_type"], "value",
+                        formula_config["engine_type"]))
+    logger.info("[RapidLayout] Using engine_name: {}",
+                getattr(layout_config["engine_type"], "value",
+                        layout_config["engine_type"]))
     table_config["engine_type"] = TableEngineType.SYCL_INFER
     table_cfg = dict(table_config.get("engine_cfg") or {})
     table_cfg.setdefault("device", device)

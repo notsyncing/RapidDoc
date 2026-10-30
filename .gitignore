@@ -58,3 +58,8 @@ build/
 
 # Reassembled OpenVINO wheel (tracked as .part* volumes)
 docker/wheels/*.whl
+
+# Ship the prebuilt sycl-infer wheel as <= 50 MB volumes (never the combined
+# wheel, which exceeds GitHub's per-file limit)
+!docker/wheels/sycl_infer-*.whl.part*
+!docker/wheels/sycl_infer-*.whl.sha256

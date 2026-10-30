@@ -1,0 +1,5 @@
+*
+!rapid_doc/
+!pyproject.toml
+!README.md
+!docker/

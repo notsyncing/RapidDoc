@@ -36,10 +36,18 @@ app = FastAPI(
 )
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# RapidDoc's OpenVINO models and the shared GPU Core are not safe to run
-# concurrently. Serialize parsing requests; health checks can still respond.
-_PARSE_LOCK = asyncio.Lock()
-_PARSE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rapiddoc-parse")
+# The sycl-infer sessions are safe to run concurrently (per-session locks and
+# one in-order device queue); the document-level workers overlap host work with
+# the device.  Keep the API concurrency bounded so a burst of uploads cannot
+# exhaust the single card or host RAM.  RAPID_DOC_API_CONCURRENCY=1 restores
+# the old serialized behavior for the OpenVINO fallback.
+try:
+    _API_CONCURRENCY = max(1, int(os.getenv("RAPID_DOC_API_CONCURRENCY", "1")))
+except ValueError:
+    _API_CONCURRENCY = 1
+_PARSE_LOCK = asyncio.Semaphore(_API_CONCURRENCY)
+_PARSE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_API_CONCURRENCY, thread_name_prefix="rapiddoc-parse")
 
 
 def _parse_in_thread(**kwargs):

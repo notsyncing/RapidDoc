@@ -90,6 +90,6 @@ def serialized_per_instance(fn):
 def doc_workers():
     """How many documents to process concurrently (RAPID_DOC_DOC_WORKERS)."""
     try:
-        return max(1, int(os.getenv("RAPID_DOC_DOC_WORKERS", "1")))
+        return max(1, int(os.getenv("RAPID_DOC_DOC_WORKERS", "6")))
     except (TypeError, ValueError):
         return 1

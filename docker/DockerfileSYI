@@ -1,0 +1,153 @@
+# RapidDoc API image backed by sycl-infer's in-process ONNX executor.
+#
+# This image differs from DockerfileOpenVINO in two ways:
+#   * the inference engine is libsycl_infer_onnx from the sycl-infer wheel;
+#   * every document-parsing stage is pinned to batch size 1, so the shared
+#     Intel iGPU (and the host RAM it borrows) stays inside a small budget.
+#
+# The wheel is built by sycl-infer's ci/Jenkinsfile.  GitHub rejects files over
+# 100 MB and warns above 50 MB, so the wheel is stored as <= 50 MB volumes plus
+# a checksum before this image is built:
+#
+#   cp ../sycl-infer/dist/sycl_infer-*.whl docker/wheels/
+#   cd docker/wheels && \
+#     split -b 45M -d -a 2 --numeric-suffixes=0 sycl_infer-*.whl \
+#         sycl_infer-0.1.0-py3-none-linux_x86_64.whl.part && \
+#     sha256sum sycl_infer-0.1.0-py3-none-linux_x86_64.whl \
+#         > sycl_infer-0.1.0-py3-none-linux_x86_64.whl.sha256 && \
+#     rm sycl_infer-*.whl
+#   docker build -f docker/DockerfileSYI -t rapid-doc-sycl:latest .
+#
+# Run (Intel GPU on the host, models baked into /app/models):
+#
+#   docker run --rm --device /dev/dri:/dev/dri \
+#     -p 8888:8888 \
+#     -v "$PWD/error_pdfs:/data:ro" \
+#     rapid-doc-sycl:latest
+#
+# Parse /data/*.pdf through POST /file_parse (see docker/README_API.md).
+# The wheel vendors the SYCL/oneDNN runtime; the container only supplies the
+# Intel GPU user-space driver (Level Zero / OpenCL / IGC).
+
+# === Builder: patched rapid-doc wheel ===
+FROM ubuntu:24.04 AS builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g; s|http://security.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends python3 python3-pip && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY rapid_doc/ ./rapid_doc/
+COPY pyproject.toml README.md ./
+RUN python3 -m pip install --break-system-packages build setuptools wheel && \
+    python3 -m build --wheel
+
+# === Runtime: Ubuntu 24.04 + Intel GPU user-space driver ===
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g; s|http://security.ubuntu.com/ubuntu/|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list && \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends \
+        python3 python3-pip curl wget gnupg ca-certificates software-properties-common \
+        libglib2.0-0 libsm6 libxext6 libxrender-dev \
+        libreoffice-writer libreoffice-calc libreoffice-impress \
+        fonts-noto-core fonts-noto-cjk fontconfig libgl1 libgomp1 && \
+    fc-cache -fv && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Level Zero / OpenCL / IGC for the Intel GPU.  The kernel driver itself is
+# the host's; /dev/dri must be passed through.
+RUN add-apt-repository -y ppa:kobuk-team/intel-graphics && \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends \
+        libze-intel-gpu1 libze1 intel-metrics-discovery intel-opencl-icd clinfo intel-gsc \
+        intel-media-va-driver-non-free libmfx-gen1.2 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+ENV PIP_INDEX_URL=https://pypi.org/simple
+ENV PIP_DEFAULT_TIMEOUT=300
+ENV PIP_RETRIES=10
+
+# The sycl-infer wheel carries the engine C ABI, the in-process ONNX executor
+# and the SYCL/oneDNN/oneAPI runtime closure.  Build it with sycl-infer's
+# ci/Jenkinsfile and place its <= 50 MB volumes in docker/wheels/; the volumes
+# are concatenated and verified here before installation.
+COPY docker/wheels/sycl_infer-*.whl.part* docker/wheels/sycl_infer-*.whl.sha256 /app/wheels/
+RUN cd /app/wheels && \
+    cat sycl_infer-*.whl.part* > sycl_infer-0.1.0-py3-none-linux_x86_64.whl && \
+    sha256sum -c sycl_infer-*.whl.sha256 && \
+    python3 -m pip install --no-cache-dir --break-system-packages \
+        sycl_infer-0.1.0-py3-none-linux_x86_64.whl && \
+    cd /app && rm -rf /app/wheels && python3 -m pip cache purge
+
+# Make the vendored ONNX executor discoverable both to ctypes
+# (SYCL_INFER_ONNX_LIB) and to the dynamic loader (its $ORIGIN closure).
+RUN SYCL_LIB_DIR="$(python3 -c 'import pathlib, sycl_infer; print(pathlib.Path(sycl_infer.__file__).parent / "_lib")')" && \
+    ln -sf "$SYCL_LIB_DIR/libsycl_infer_onnx.so.1.0.0" /usr/local/lib/libsycl_infer_onnx.so.1 && \
+    ln -sf "$SYCL_LIB_DIR/libsycl_infer_onnx.so.1.0.0" /usr/local/lib/libsycl_infer_onnx.so && \
+    echo "$SYCL_LIB_DIR" > /etc/ld.so.conf.d/sycl-infer.conf && \
+    ldconfig && \
+    test -f /usr/local/lib/libsycl_infer_onnx.so.1
+
+# Install the patched rapid-doc wheel + its API extras.  onnxruntime is not
+# used by the sycl path, but several RapidDoc/RapidOCR modules import it as a
+# fallback; keeping it installed makes those imports non-fatal.
+COPY --from=builder /src/dist/rapid_doc-*.whl /app/wheels/
+RUN set -e; wheel="$(ls /app/wheels/rapid_doc-*.whl)"; \
+    python3 -m pip install --no-cache-dir --break-system-packages \
+        --ignore-installed typing-extensions \
+        "${wheel}[api]" \
+        "onnxruntime==1.24.4" && \
+    rm -rf /app/wheels && python3 -m pip cache purge
+
+# Copy scripts and download the pipeline models at build time, exactly as the
+# OpenVINO image does.  The local download_file.py keeps only the models the
+# pipeline actually uses (PP-DocLayoutV3, PP-FormulaNet+, the table models and
+# their dictionaries); RapidOCR ships its own det/rec models in its wheel.
+COPY docker/.env.example /app/
+COPY docker/start_with_env.sh /app/
+RUN sed -i 's/\r$//' /app/start_with_env.sh && chmod +x /app/start_with_env.sh
+
+COPY docker/app.py docker/file_converter.py docker/download_file.py docker/download_models.py docker/models_download_utils.py /app/
+
+ENV API_PORT=8888 STARTUP_WAIT_TIME=15 LOG_LEVEL=INFO
+ENV MINERU_DEVICE_MODE=cpu RAPID_MODELS_DIR=/app/models
+RUN python3 download_models.py
+
+# Route every model family to libsycl_infer_onnx.  The API service builds the
+# pipeline through ModelSingleton, so this env is what selects the engine
+# (rapid_doc/backend/pipeline/pipeline_analyze.py::_apply_engine_env).
+ENV RAPID_DOC_ENGINE=sycl-infer \
+    SYCL_INFER_ONNX_DEVICE=GPU \
+    SYCL_INFER_ONNX_LIB=/usr/local/lib/libsycl_infer_onnx.so.1
+
+# A770 single-card defaults, measured on the 957-page error_pdfs corpus:
+# 0.73 s/page at six document workers with the batch sizes below.  The
+# per-document workers overlap host render/post with the shared in-order GPU
+# queue; the layout/OCR/table batch sizes stay inside the 16 GB card.
+# Explicit env wins, so a smaller-memory deployment can still set batches to 1.
+ENV RAPID_DOC_LAYOUT_BATCH_SIZE=16 \
+    RAPID_DOC_OCR_DET_BATCH_SIZE=32 \
+    RAPID_DOC_OCR_REC_BATCH_SIZE=128 \
+    RAPID_DOC_OCR_CLS_BATCH_SIZE=32 \
+    RAPID_DOC_TABLE_STRUCTURE_BATCH_SIZE=64 \
+    RAPID_DOC_TABLE_REC_BATCH_SIZE=32 \
+    RAPID_DOC_TABLE_CLS_BATCH_SIZE=32 \
+    RAPID_DOC_FORMULA_BATCH_SIZE=32 \
+    RAPID_DOC_PAGE_BATCH_SIZE=24 \
+    RAPID_DOC_OCR_MAX_WH_RATIO=8 \
+    RAPID_DOC_DOC_WORKERS=6 \
+    RAPID_DOC_API_CONCURRENCY=3 \
+    MINERU_PROCESSING_WINDOW_SIZE=64
+
+EXPOSE 8888 8888
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:$API_PORT/health || exit 1
+
+CMD ["./start_with_env.sh"]

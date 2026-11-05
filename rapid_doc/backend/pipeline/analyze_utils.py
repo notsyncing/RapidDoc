@@ -5,8 +5,9 @@
 import copy
 import os
 import re
+from html import escape
 from typing import List, Dict, Tuple
-from collections import defaultdict
+from collections import Counter, defaultdict
 from functools import lru_cache
 
 import cv2
@@ -514,6 +515,117 @@ def _table_html_blank_ratio(html_code: str) -> float:
     return blank / len(cells)
 
 
+def _visible_html_text(html_code: str) -> str:
+    """Text content of an HTML fragment with tags and whitespace removed."""
+    return re.sub(r"<[^>]+>|&nbsp;|\s", "", html_code or "")
+
+
+def _page_text_in_bbox(page_dict: Dict, bbox) -> str:
+    """Native text spans whose centre lies inside a table region."""
+    return _visible_html_text("".join(
+        text for _, text in _text_spans_in_bbox(page_dict, bbox)))
+
+
+def _text_spans_in_bbox(page_dict: Dict, bbox):
+    """Return (bbox, text) for native spans centred inside a region."""
+    x0, y0, x1, y1 = (float(value) for value in bbox)
+    spans = []
+    for block in page_dict.get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = span.get("text") or ""
+                if not text.strip():
+                    continue
+                span_bbox = getattr(span.get("bbox"), "bbox", span.get("bbox"))
+                if not span_bbox or len(span_bbox) < 4:
+                    continue
+                box = [float(value) for value in span_bbox[:4]]
+                cx = (box[0] + box[2]) / 2
+                cy = (box[1] + box[3]) / 2
+                if x0 <= cx <= x1 and y0 <= cy <= y1:
+                    spans.append((box, text))
+    return spans
+
+
+def _native_vertical_text_fragment(page_dict: Dict, table_bbox):
+    """Return the text when a table region is one narrow vertical text column.
+
+    A cross-page table's first cell can continue onto the next page as an
+    upright, one-character-per-line column at the page edge.  The layout model
+    labels that strip as a table, native table recovery has no grid to recover,
+    and the structure model clips the first/last glyphs.  The PDF text itself is
+    exact, so emit it as text instead of as a table.
+    """
+    spans = _text_spans_in_bbox(page_dict, table_bbox)
+    if len(spans) < 3:
+        return None
+    table_w = float(table_bbox[2]) - float(table_bbox[0])
+    table_h = float(table_bbox[3]) - float(table_bbox[1])
+    if table_w <= 0 or table_h <= 0:
+        return None
+    text_x0 = min(box[0] for box, _ in spans)
+    text_y0 = min(box[1] for box, _ in spans)
+    text_x1 = max(box[2] for box, _ in spans)
+    text_y1 = max(box[3] for box, _ in spans)
+    text_w = text_x1 - text_x0
+    text_h = text_y1 - text_y0
+    widths = [box[2] - box[0] for box, _ in spans]
+    heights = [box[3] - box[1] for box, _ in spans]
+    # A vertical column is narrow, spans most of the region's height, and its
+    # glyph boxes are at least as tall as they are wide.
+    if text_w > 0.1 * table_w or text_h < 0.5 * table_h:
+        return None
+    if float(np.median(widths)) >= 2.0 * float(np.median(heights)):
+        return None
+    return _visible_html_text("".join(text for _, text in spans))
+
+
+def _native_table_text_coverage(page_dict: Dict, table_bbox, html_code: str):
+    """Fraction of the table region's native characters the HTML preserves.
+
+    A cross-page continuation table can legitimately have one dense cell and
+    many empty ones.  The blank-cell ratio then rejects a complete native
+    parse and sends the table to a structure model, which cannot recover the
+    narrow vertical text and emits a mostly-empty grid.  Multiset character
+    coverage separates "the native parse kept the text" (accept) from "the
+    native parse lost it" (fall back).
+    """
+    source_text = _page_text_in_bbox(page_dict, table_bbox)
+    if len(source_text) < 4:
+        return None
+    source = Counter(source_text)
+    parsed = Counter(_visible_html_text(html_code))
+    matched = sum(min(count, parsed[char]) for char, count in source.items())
+    return matched / len(source_text)
+
+
+_SIGNED_NUMBER_RE = re.compile(r"[-−－]\s*\d[\d,]*(?:\.\d+)?")
+
+
+def _signed_numbers(text: str) -> set:
+    """Signed numeric tokens, with the various PDF minus glyphs normalised."""
+    return {
+        re.sub(r"\s+", "", match).replace("−", "-").replace("－", "-")
+        for match in _SIGNED_NUMBER_RE.findall(text)
+    }
+
+
+def _native_table_lost_signed_number(page_dict: Dict, table_bbox, html_code: str) -> bool:
+    """True when the native HTML drops the sign of a source negative number.
+
+    A minus glyph is often only 0.3 pt tall.  The native cell builder's
+    thin-glyph filter can discard it while keeping the digits, which turns a
+    negative balance into a positive one.  Character coverage cannot see that
+    (the sign is still in the region text but may be in another cell), so a
+    sparse native table is only trusted when its signed numbers survive.
+    """
+    source_signed = _signed_numbers(_page_text_in_bbox(page_dict, table_bbox))
+    if not source_signed:
+        return False
+    parsed_signed = _signed_numbers(_visible_html_text(html_code))
+    return bool(source_signed - parsed_signed)
+
+
 def _count_uncovered_text_boxes(det_res, ocr_result, min_overlap: float = 0.3):
     """Count detected text boxes that native PDF text extraction did not cover.
 
@@ -593,6 +705,31 @@ def _prepare_table_data(
     table_class = None
     table_class_score = 1.0
     pdf_not_rotate = page_dict.get("rotate_label") not in ["90", "180", "270"]
+    poly = table_res_dict['table_res']['poly']
+    table_bbox = (poly[0] / scale, poly[1] / scale, poly[4] / scale, poly[5] / scale)
+    table_bbox_scaled = (poly[0], poly[1], poly[4], poly[5])
+    has_embedded_formula = any(
+        item.get('bbox') and _box_center_in(table_bbox_scaled, item['bbox'])
+        for item in table_res_dict['single_page_mfdetrec_res'] + table_res_dict['checkbox_res']
+    )
+    has_native_image = any(
+        img.get('bbox') and _boxes_overlap(table_bbox, img['bbox'])
+        for img in page_dict.get('ori_image_list', [])
+    )
+    if (not table_res_dict['ocr_enable'] and not has_embedded_formula
+            and not has_native_image):
+        vertical_text = _native_vertical_text_fragment(page_dict, table_bbox)
+        if vertical_text:
+            logger.info(
+                f'DocVortex vertical text fragment kept as native text '
+                f'({len(vertical_text)} chars)')
+            table_res = table_res_dict['table_res']
+            table_res['html'] = (
+                f"<table><tbody><tr><td>{escape(vertical_text)}</td></tr></tbody></table>")
+            table_res['rule_table_score'] = 1.0
+            table_res['table_parse_method'] = 'native_vertical_text'
+            table_res.pop('layout_image_list', None)
+            return
     if (
         use_docvortex_table_rules(table_config) and not table_res_dict['ocr_enable']
         and pdf_not_rotate and '_source_pdf_bytes' in page_dict
@@ -614,14 +751,35 @@ def _prepare_table_data(
                 if (native_result is not None and native_result.html.strip()
                         and native_result.confidence >= rule_table_score_threshold):
                     blank_ratio = _table_html_blank_ratio(native_result.html)
-                    if blank_ratio <= 0.45:
+                    text_coverage = _native_table_text_coverage(
+                        page_dict, table_bbox, native_result.html)
+                    lost_sign = _native_table_lost_signed_number(
+                        page_dict, table_bbox, native_result.html)
+                    # A cross-page continuation table can be mostly empty cells
+                    # around one long (often narrow, vertically-wrapped) cell.
+                    # If the native parse preserves essentially all of the
+                    # region's embedded text, its sparse-looking grid is real;
+                    # sending it to the structure model loses the paragraph.
+                    # A dropped minus sign is never acceptable: the native
+                    # cell builder can discard the thin minus glyph.
+                    if (blank_ratio <= 0.45 or (
+                            text_coverage is not None and text_coverage >= 0.99
+                            and not lost_sign)):
+                        if blank_ratio > 0.45:
+                            logger.info(
+                                f'DocVortex native sparse table kept by text coverage '
+                                f'({blank_ratio:.2f}, {text_coverage:.2f})')
                         table_res_dict['table_res'].pop('layout_image_list', None)
                         table_res_dict['table_res']['html'] = native_result.html
                         table_res_dict['table_res']['rule_table_score'] = native_result.confidence
                         table_res_dict['table_res']['table_parse_method'] = 'docvortex_native'
                         return
+                    coverage_text = (
+                        f'{text_coverage:.2f}' if text_coverage is not None else 'n/a')
                     logger.info(
-                        f'DocVortex native table too sparse ({blank_ratio:.2f}), fallback to model'
+                        f'DocVortex native table too sparse ({blank_ratio:.2f}, '
+                        f'text coverage {coverage_text}, lost sign {lost_sign}), '
+                        f'fallback to model'
                     )
             except ImportError:
                 raise

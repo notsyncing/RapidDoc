@@ -25,4 +25,35 @@ echo "======================================"
 
 # 启动 API 服务
 cd /app
-python3 app.py
+
+# A lost SYCL/Level-Zero device leaves the process's whole Unified Runtime
+# context unusable.  app.py exits with RAPID_DOC_DEVICE_LOST_EXIT_CODE in that
+# case; restart only that status here so the service recovers even when the
+# container is started without a restart policy.  Any other exit is final
+# (the container's own restart policy still applies).
+RESTART_CODE=${RAPID_DOC_DEVICE_LOST_EXIT_CODE:-75}
+CHILD_PID=""
+
+shutdown() {
+    trap - TERM INT
+    if [ -n "$CHILD_PID" ]; then
+        kill -TERM "$CHILD_PID" 2>/dev/null || true
+        wait "$CHILD_PID" 2>/dev/null || true
+    fi
+    exit 143
+}
+trap shutdown TERM INT
+
+while true; do
+    status=0
+    python3 app.py &
+    CHILD_PID=$!
+    wait "$CHILD_PID" || status=$?
+    CHILD_PID=""
+
+    if [ "$status" -ne "$RESTART_CODE" ]; then
+        exit "$status"
+    fi
+    echo "[supervisor] device lost (exit $status); restarting the API process in 2s..."
+    sleep 2
+done

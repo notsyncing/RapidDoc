@@ -98,6 +98,19 @@ batch 输出目录读取自己的结果，batch 完成后统一清理。`clear_o
 | `RAPID_DOC_API_QUEUE_MAX` | `64` | 等待队列上限，满时返回 503 |
 | `RAPID_DOC_API_CONCURRENCY` | `1` | 保留的响应/队列线程数；实际解析由 batch 串行驱动 |
 
+### 设备丢失自动重启
+
+`libsycl_infer_onnx` 报 `UR_RESULT_ERROR_DEVICE_LOST`（Level Zero error 20）时，
+进程的 Unified Runtime context 和全部队列已不可用，重建单个 session 无法恢复。
+sycl-infer 层检测到该错误后会立即以退出码 `75` 退出；
+`start_with_env.sh` 只在收到该退出码时重新启动 `app.py`，因此即使容器没有
+`restart: always` 也能自动恢复。当前失败请求会返回 500，不保留进度。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `RAPID_DOC_RESTART_ON_DEVICE_LOST` | `1` | `0` 关闭自动重启（改为抛出 `SyclDeviceLostError`） |
+| `RAPID_DOC_DEVICE_LOST_EXIT_CODE` | `75` | 触发 supervisor 重启的退出码 |
+
 `RAPID_DOC_DOC_WORKERS=6` 和 layout 16 / det 32 / rec 128 / table 64 / page 24 保持不变。
 **公式模型也走 sycl-infer**；`RAPID_DOC_FORMULA_ENGINE` 未设置时，layout / OCR /
 table / formula 四个模型族都在同一张卡上执行。`SYCL_INFER_TRIM_MB=64` 控制每个

@@ -22,10 +22,12 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 from loguru import logger
+from rapid_doc.utils.device_restart import is_device_lost, restart_process
 from rapid_doc.utils.gpu_lock import doc_workers, serialized_per_instance
 
 __all__ = [
     "SyclInferError",
+    "SyclDeviceLostError",
     "SyclInferSession",
     "SyclOcrSession",
     "attach_sycl_sessions",
@@ -71,6 +73,23 @@ class _DirectOutput(ctypes.Structure):
 
 class SyclInferError(RuntimeError):
     pass
+
+
+class SyclDeviceLostError(SyclInferError):
+    """The device is gone; the process must be restarted to recover."""
+
+
+def _raise_failure(message: str, *, source: str = "sycl-infer") -> None:
+    """Turn a native failure into the right Python exception.
+
+    A device-lost failure poisons every queue in the process, so the default
+    action is to exit and let the supervisor start a fresh process.  If that
+    is disabled, callers still get a distinguishable exception.
+    """
+    if is_device_lost(message):
+        restart_process(message, source=source)
+        raise SyclDeviceLostError(message)
+    raise SyclInferError(message)
 
 
 _lib = None
@@ -274,7 +293,8 @@ class SyclInferSession:
             self._drop_outputs.encode() if self._drop_outputs else None,
             self._dnnl, ctypes.byref(h))
         if st != 0:
-            raise SyclInferError(f"cannot load {self.path} on {self.device}: {_last_error()}")
+            _raise_failure(f"cannot load {self.path} on {self.device}: {_last_error()}",
+                           source=f"sycl-infer:{self.model}")
         self._handle = h
         self._info = self._read_info()
 
@@ -283,7 +303,8 @@ class SyclInferSession:
         p = ctypes.c_void_p()
         n = ctypes.c_size_t()
         if lib.syi_onnx_info_json(self._handle, ctypes.byref(p), ctypes.byref(n)) != 0:
-            raise SyclInferError(f"cannot read model info: {_last_error()}")
+            _raise_failure(f"cannot read model info: {_last_error()}",
+                           source=f"sycl-infer:{self.model}")
         try:
             return json.loads(ctypes.string_at(p, n.value).decode("utf-8"))
         finally:
@@ -308,7 +329,8 @@ class SyclInferSession:
             raise SyclInferError("this libsycl_infer_onnx predates output modes")
         st = lib.syi_onnx_set_output_mode(self._handle, str(output).encode(), str(mode).encode())
         if st != 0:
-            raise SyclInferError(f"cannot set the output mode of {output!r}: {_last_error()}")
+            _raise_failure(f"cannot set the output mode of {output!r}: {_last_error()}",
+                           source=f"sycl-infer:{self.model}")
 
     @serialized_per_instance
     def run(self, inputs: Dict[str, np.ndarray], copy: Optional[bool] = None) -> List[np.ndarray]:
@@ -342,7 +364,8 @@ class SyclInferSession:
             st = lib.syi_onnx_run_direct(self._handle, descs, len(inputs), outs, 8,
                                          ctypes.byref(n))
             if st != 0:
-                raise SyclInferError(_last_error() or "the ONNX run failed")
+                _raise_failure(_last_error() or "the ONNX run failed",
+                               source=f"sycl-infer:{self.model}")
             result = []
             for i in range(n.value):
                 o = outs[i]
@@ -371,14 +394,16 @@ class SyclInferSession:
         st = lib.syi_onnx_run_wire(self._handle, req, len(body), ctypes.byref(out),
                                    ctypes.byref(out_n))
         if st != 0:
-            raise SyclInferError(_last_error() or "the ONNX run failed")
+            _raise_failure(_last_error() or "the ONNX run failed",
+                           source=f"sycl-infer:{self.model}")
         try:
             raw = ctypes.string_at(out, out_n.value)
         finally:
             lib.syi_onnx_free(out)
         status, msg, outs2 = _unpack_response(raw)
         if status != 0:
-            raise SyclInferError(f"model {self.model!r} failed: {msg}")
+            _raise_failure(f"model {self.model!r} failed: {msg}",
+                           source=f"sycl-infer:{self.model}")
         return [a for _, a in outs2]
 
     def run_one(self, arr: np.ndarray) -> List[np.ndarray]:

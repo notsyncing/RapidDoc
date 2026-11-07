@@ -25,6 +25,7 @@ from loguru import logger
 
 from file_converter import ensure_pdf, OFFICE_EXTENSIONS
 from rapid_doc.cli.common import aio_do_parse, pdf_suffixes, image_suffixes, office_suffixes
+from rapid_doc.utils.device_restart import is_device_lost, restart_process
 from rapid_doc.utils.empty_office import normalize_empty_office_bytes
 from rapid_doc.utils.hash_utils import make_hashable
 from rapid_doc.utils.pdf_image_tools import images_bytes_to_pdf_bytes
@@ -739,6 +740,8 @@ async def _execute_batch(batch: List[_Unit]) -> None:
                 _BATCH_EXECUTOR, _run_rapid_doc_batch_sync, batch, batch_root)
         except Exception as e:
             batch_error = e
+            if is_device_lost(e):
+                restart_process(e, source="api-batch")
             logger.exception(e)
         finally:
             shutil.rmtree(batch_root, ignore_errors=True)
@@ -989,6 +992,8 @@ async def file_parse(
         return JSONResponse(
             status_code=e.status_code, content={"error": e.message})
     except Exception as e:
+        if is_device_lost(e):
+            restart_process(e, source="api")
         logger.exception(e)
         return JSONResponse(
             status_code=500,

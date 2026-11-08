@@ -102,13 +102,16 @@ batch 输出目录读取自己的结果，batch 完成后统一清理。`clear_o
 
 `libsycl_infer_onnx` 报 `UR_RESULT_ERROR_DEVICE_LOST`（Level Zero error 20）时，
 进程的 Unified Runtime context 和全部队列已不可用，重建单个 session 无法恢复。
-sycl-infer 层检测到该错误后会立即以退出码 `75` 退出；
-`start_with_env.sh` 只在收到该退出码时重新启动 `app.py`，因此即使容器没有
+设备分配失败（`device allocation failed` / `UR_RESULT_ERROR_OUT_OF_RESOURCES`）
+同样无法在进程内恢复：executor 已经在分配点回收空闲池并重试过一次，能抛到
+Python 说明本进程常驻的模型加上本次调用的工作集已经放不进这张卡，后续调用只会
+在同一份预算上继续失败。sycl-infer 层检测到这两类错误后都会立即以退出码 `75`
+退出；`start_with_env.sh` 只在收到该退出码时重新启动 `app.py`，因此即使容器没有
 `restart: always` 也能自动恢复。当前失败请求会返回 500，不保留进度。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `RAPID_DOC_RESTART_ON_DEVICE_LOST` | `1` | `0` 关闭自动重启（改为抛出 `SyclDeviceLostError`） |
+| `RAPID_DOC_RESTART_ON_DEVICE_LOST` | `1` | `0` 关闭自动重启（改为抛出 `SyclDeviceLostError` / `SyclOutOfMemoryError`） |
 | `RAPID_DOC_DEVICE_LOST_EXIT_CODE` | `75` | 触发 supervisor 重启的退出码 |
 
 `RAPID_DOC_DOC_WORKERS=6` 和 layout 16 / det 32 / rec 128 / table 64 / page 24 保持不变。

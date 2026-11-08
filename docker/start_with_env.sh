@@ -26,11 +26,14 @@ echo "======================================"
 # 启动 API 服务
 cd /app
 
-# A lost SYCL/Level-Zero device leaves the process's whole Unified Runtime
-# context unusable.  app.py exits with RAPID_DOC_DEVICE_LOST_EXIT_CODE in that
-# case; restart only that status here so the service recovers even when the
-# container is started without a restart policy.  Any other exit is final
-# (the container's own restart policy still applies).
+# An unusable SYCL/Level-Zero device leaves the process no way to recover:
+# a lost device takes the whole Unified Runtime context with it, and a failed
+# device allocation means every later call allocates against the same
+# exhausted budget (the executor has already trimmed its pool and retried).
+# app.py exits with RAPID_DOC_DEVICE_LOST_EXIT_CODE in either case; restart
+# only that status here so the service recovers even when the container is
+# started without a restart policy.  Any other exit is final (the container's
+# own restart policy still applies).
 RESTART_CODE=${RAPID_DOC_DEVICE_LOST_EXIT_CODE:-75}
 CHILD_PID=""
 
@@ -54,6 +57,6 @@ while true; do
     if [ "$status" -ne "$RESTART_CODE" ]; then
         exit "$status"
     fi
-    echo "[supervisor] device lost (exit $status); restarting the API process in 2s..."
+    echo "[supervisor] device failure (exit $status); restarting the API process in 2s..."
     sleep 2
 done

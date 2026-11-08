@@ -22,12 +22,17 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 from loguru import logger
-from rapid_doc.utils.device_restart import is_device_lost, restart_process
+from rapid_doc.utils.device_restart import (
+    is_device_lost,
+    is_device_memory_exhausted,
+    restart_process,
+)
 from rapid_doc.utils.gpu_lock import doc_workers, serialized_per_instance
 
 __all__ = [
     "SyclInferError",
     "SyclDeviceLostError",
+    "SyclOutOfMemoryError",
     "SyclInferSession",
     "SyclOcrSession",
     "attach_sycl_sessions",
@@ -79,16 +84,30 @@ class SyclDeviceLostError(SyclInferError):
     """The device is gone; the process must be restarted to recover."""
 
 
+class SyclOutOfMemoryError(SyclInferError):
+    """The device has no room for the call; a fresh process is needed.
+
+    The executor trims its own pool and retries once at the allocation site,
+    so this reaching Python means the process's resident models and the
+    call's working set no longer fit in the card together.
+    """
+
+
 def _raise_failure(message: str, *, source: str = "sycl-infer") -> None:
     """Turn a native failure into the right Python exception.
 
-    A device-lost failure poisons every queue in the process, so the default
-    action is to exit and let the supervisor start a fresh process.  If that
-    is disabled, callers still get a distinguishable exception.
+    A device-lost failure poisons every queue in the process, and a failed
+    device allocation means no later call can get memory either.  Neither is
+    recoverable in-process, so the default action is to exit and let the
+    supervisor start a fresh process.  If that is disabled, callers still get
+    a distinguishable exception.
     """
     if is_device_lost(message):
         restart_process(message, source=source)
         raise SyclDeviceLostError(message)
+    if is_device_memory_exhausted(message):
+        restart_process(message, source=source)
+        raise SyclOutOfMemoryError(message)
     raise SyclInferError(message)
 
 

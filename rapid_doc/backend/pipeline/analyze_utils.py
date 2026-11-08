@@ -580,6 +580,55 @@ def _native_vertical_text_fragment(page_dict: Dict, table_bbox):
     return _visible_html_text("".join(text for _, text in spans))
 
 
+def _native_vertical_text_column(page_dict: Dict, table_bbox):
+    """Return a narrow, tall text column even when its lines hold several glyphs.
+
+    Wrapped continuation text extracts as multi-character horizontal runs, so
+    its individual boxes are wider than they are tall - the shape
+    ``_native_vertical_text_fragment`` rejects.  The aggregate column geometry
+    still identifies it.  Used only after the structure model has produced a
+    lossy result; the early native route keeps the stricter one-glyph rule so
+    ordinary tables are never pre-empted.
+    """
+    spans = _text_spans_in_bbox(page_dict, table_bbox)
+    if len(spans) < 5:
+        return None
+    table_w = float(table_bbox[2]) - float(table_bbox[0])
+    table_h = float(table_bbox[3]) - float(table_bbox[1])
+    if table_w <= 0 or table_h <= 0:
+        return None
+    text_w = max(box[2] for box, _ in spans) - min(box[0] for box, _ in spans)
+    text_h = max(box[3] for box, _ in spans) - min(box[1] for box, _ in spans)
+    heights = [box[3] - box[1] for box, _ in spans]
+    median_height = float(np.median(heights))
+    if text_w > 0.15 * table_w or text_h < 0.5 * table_h:
+        return None
+    if median_height > 0 and text_h < 5.0 * median_height:
+        return None
+    # Keep the PDF stream order: small glyphs (a superscript "2", a bracketed
+    # number) sit on a slightly different baseline, so re-sorting by the top
+    # edge would split "2、" into "、2".  The stream is already top-to-bottom.
+    return _visible_html_text("".join(text for _, text in spans))
+
+
+_COVERAGE_NORMALISE = str.maketrans({
+    "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
+    "\u2013": "-", "\u2014": "-", "\u2212": "-", "\uff0d": "-",
+    "\u200b": None, "\ufeff": None,
+})
+
+
+def _coverage_text(text: str) -> str:
+    """Normalise typographic quotes/dashes before comparing character sets.
+
+    The native table HTML uses ASCII quotes where the PDF text carries the
+    typographic form, so a byte-for-byte multiset comparison reports a loss
+    that is not one.  Both sides are normalised; nothing is discarded except
+    zero-width markers.
+    """
+    return (text or "").translate(_COVERAGE_NORMALISE)
+
+
 def _native_table_text_coverage(page_dict: Dict, table_bbox, html_code: str):
     """Fraction of the table region's native characters the HTML preserves.
 
@@ -590,11 +639,11 @@ def _native_table_text_coverage(page_dict: Dict, table_bbox, html_code: str):
     coverage separates "the native parse kept the text" (accept) from "the
     native parse lost it" (fall back).
     """
-    source_text = _page_text_in_bbox(page_dict, table_bbox)
+    source_text = _coverage_text(_page_text_in_bbox(page_dict, table_bbox))
     if len(source_text) < 4:
         return None
     source = Counter(source_text)
-    parsed = Counter(_visible_html_text(html_code))
+    parsed = Counter(_coverage_text(_visible_html_text(html_code)))
     matched = sum(min(count, parsed[char]) for char, count in source.items())
     return matched / len(source_text)
 
@@ -624,6 +673,337 @@ def _native_table_lost_signed_number(page_dict: Dict, table_bbox, html_code: str
         return False
     parsed_signed = _signed_numbers(_visible_html_text(html_code))
     return bool(source_signed - parsed_signed)
+
+
+def _native_text_runs(page_dict: Dict, table_bbox):
+    """Split the region's native characters into visual lines and runs.
+
+    A run is a maximal set of glyphs on one baseline without a horizontal
+    gap wider than half a glyph.  Columns in a borderless table are separated
+    by gaps of that size, while glyphs inside one cell touch, so the runs
+    approximate cells without needing vertical rules.
+    """
+    x0, y0, x1, y1 = (float(value) for value in table_bbox)
+    items = []
+    for char in page_dict.get("chars") or ():
+        char_bbox = getattr(char.get("bbox"), "bbox", char.get("bbox"))
+        text = str(char.get("char") or "")
+        if not char_bbox or len(char_bbox) < 4 or not text or text in ("\r", "\n"):
+            continue
+        left, top, right, bottom = (float(value) for value in char_bbox[:4])
+        if right - left <= 0.1 and text.isspace():
+            continue
+        cx, cy = (left + right) / 2.0, (top + bottom) / 2.0
+        if x0 <= cx <= x1 and y0 <= cy <= y1:
+            items.append((top, left, right, bottom, text))
+    if not items:
+        return [], 1.0
+    widths = [item[2] - item[1] for item in items if item[2] > item[1]]
+    heights = [item[3] - item[0] for item in items if item[3] > item[0]]
+    median_width = float(np.median(widths)) if widths else 1.0
+    median_height = float(np.median(heights)) if heights else 1.0
+    items.sort(key=lambda item: (item[0], item[1]))
+    lines = []
+    for item in items:
+        center_y = (item[0] + item[3]) / 2.0
+        if lines and abs(center_y - lines[-1][0]) <= 0.6 * median_height:
+            lines[-1][1].append(item)
+        else:
+            lines.append([center_y, [item]])
+    split_gap = max(0.5 * median_width, 1.5)
+    runs = []
+    for center_y, line_items in lines:
+        line_items.sort(key=lambda item: item[1])
+        current = [line_items[0]]
+        for item in line_items[1:]:
+            if item[1] - current[-1][2] <= split_gap:
+                current.append(item)
+            else:
+                runs.append((center_y, current[0][1], current[-1][2],
+                             "".join(entry[4] for entry in current)))
+                current = [item]
+        runs.append((center_y, current[0][1], current[-1][2],
+                     "".join(entry[4] for entry in current)))
+    return runs, median_height
+
+
+def _native_table_rule_centers(page_dict: Dict, table_bbox):
+    """Y centres of the horizontal rules that can delimit logical table rows."""
+    x0, y0, x1, y1 = (float(value) for value in table_bbox)
+    table_w = x1 - x0
+    if table_w <= 0:
+        return []
+    centers = []
+    table_page = page_dict.get("_docvortex_table_page")
+    if table_page is not None:
+        for rule in getattr(table_page, "drawing_lines", ()) or ():
+            rule_bbox = getattr(rule, "bbox", None)
+            if not rule_bbox or len(rule_bbox) < 4:
+                continue
+            orientation = getattr(rule, "orientation", None)
+            rule_w = float(rule_bbox[2]) - float(rule_bbox[0])
+            rule_h = float(rule_bbox[3]) - float(rule_bbox[1])
+            if orientation == "vertical" or rule_h > rule_w:
+                continue
+            if rule_w < 0.6 * table_w:
+                continue
+            center = (float(rule_bbox[1]) + float(rule_bbox[3])) / 2.0
+            if y0 - 5.0 <= center <= y1 + 5.0:
+                centers.append(center)
+    else:
+        for line in page_dict.get("vector_lines") or ():
+            try:
+                x_start, y_start = float(line["x1"]), float(line["y1"])
+                x_end, y_end = float(line["x2"]), float(line["y2"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if abs(y_start - y_end) > 1.0 or abs(x_end - x_start) < 0.6 * table_w:
+                continue
+            center = (y_start + y_end) / 2.0
+            if y0 - 5.0 <= center <= y1 + 5.0:
+                centers.append(center)
+    return sorted({round(center, 2) for center in centers})
+
+
+def _runs_to_cells(runs):
+    """Group one logical row's runs into cells by horizontal overlap."""
+    run_count = len(runs)
+    parent = list(range(run_count))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(first, second):
+        first, second = find(first), find(second)
+        if first != second:
+            parent[first] = second
+
+    for i in range(run_count):
+        for j in range(i + 1, run_count):
+            left = max(runs[i][1], runs[j][1])
+            right = min(runs[i][2], runs[j][2])
+            smaller = min(runs[i][2] - runs[i][1], runs[j][2] - runs[j][1])
+            if smaller > 0 and (right - left) / smaller >= 0.30:
+                union(i, j)
+
+    groups = {}
+    for index in range(run_count):
+        groups.setdefault(find(index), []).append(index)
+    cells = []
+    for members in groups.values():
+        ordered = sorted((runs[index] for index in members),
+                         key=lambda item: (item[0], item[1]))
+        text = "".join(item[3] for item in ordered).strip()
+        cells.append([min(item[1] for item in ordered),
+                      max(item[2] for item in ordered), text])
+    cells.sort(key=lambda cell: cell[0])
+    return cells
+
+
+def _cluster_cell_columns(bands, table_width):
+    """Infer leaf column ranges from the populated cells of the data rows."""
+    ranges = []
+    for cells in bands:
+        if len(cells) < 2:
+            continue
+        for left, right, text in cells:
+            if text and right > left and (right - left) < 0.6 * table_width:
+                ranges.append((left, right))
+    if not ranges:
+        return []
+    parent = list(range(len(ranges)))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(first, second):
+        first, second = find(first), find(second)
+        if first != second:
+            parent[first] = second
+
+    for i in range(len(ranges)):
+        for j in range(i + 1, len(ranges)):
+            left = max(ranges[i][0], ranges[j][0])
+            right = min(ranges[i][1], ranges[j][1])
+            smaller = min(ranges[i][1] - ranges[i][0], ranges[j][1] - ranges[j][0])
+            if smaller > 0 and (right - left) / smaller >= 0.5:
+                union(i, j)
+    columns = {}
+    for index in range(len(ranges)):
+        columns.setdefault(find(index), []).append(ranges[index])
+    tracks = []
+    for members in columns.values():
+        tracks.append((min(item[0] for item in members),
+                       max(item[1] for item in members)))
+    tracks.sort(key=lambda track: (track[0], track[1]))
+    return tracks
+
+
+def _native_text_grid_html(page_dict: Dict, table_bbox, rules=None):
+    """Rebuild a borderless table from its native text and horizontal rules.
+
+    A financial table often has row rules but no vertical separators.  The
+    layout model still finds the region, but DocVortex has no column tracks to
+    recover and the structure model merges adjacent narrow columns, so the
+    HTML loses the cell structure.  The PDF text is exact: rows are the bands
+    between the horizontal rules, and within a row the glyph runs separated by
+    a visible gap are the cells.  Returns ``None`` unless at least two columns
+    can be inferred.
+    """
+    x0, y0, x1, y1 = (float(value) for value in table_bbox)
+    table_w = x1 - x0
+    if table_w <= 0:
+        return None
+    runs, _median_height = _native_text_runs(page_dict, table_bbox)
+    if not runs:
+        return None
+    rule_centers = _native_table_rule_centers(page_dict, table_bbox) if rules is None else sorted({
+        round((float(rule[1]) + float(rule[3])) / 2.0, 2) for rule in rules
+    })
+    cuts = sorted({round(y0, 2), *rule_centers, round(y1, 2)})
+    bands = []
+    for top, bottom in zip(cuts, cuts[1:]):
+        if bottom <= top:
+            continue
+        band_runs = [run for run in runs if top <= run[0] < bottom]
+        if not band_runs:
+            continue
+        bands.append(_runs_to_cells(band_runs))
+    if not bands:
+        return None
+    columns = _cluster_cell_columns(bands, table_w)
+    if len(columns) < 2:
+        return None
+
+    def column_for(cell):
+        left, right = cell[0], cell[1]
+        best = None
+        best_overlap = 0.0
+        for index, (track_left, track_right) in enumerate(columns):
+            overlap = min(right, track_right) - max(left, track_left)
+            if overlap > best_overlap:
+                best, best_overlap = index, overlap
+        if best is not None:
+            return best
+        center = (left + right) / 2.0
+        return min(range(len(columns)),
+                   key=lambda index: abs(center - (columns[index][0] + columns[index][1]) / 2.0))
+
+    column_count = len(columns)
+    rows = []
+    for cells in bands:
+        populated = [cell for cell in cells if cell[2]]
+        if len(populated) == 1:
+            rows.append([(populated[0][2], column_count)])
+            continue
+        row = [""] * column_count
+        for cell in populated:
+            index = column_for(cell)
+            row[index] = (row[index] + cell[2]) if row[index] else cell[2]
+        rows.append([(text, 1) for text in row])
+    if sum(1 for row in rows if row) < 1:
+        return None
+    html_rows = []
+    for row in rows:
+        cells = []
+        for text, colspan in row:
+            span = f' colspan="{colspan}"' if colspan > 1 else ""
+            cells.append(f"<td{span}>{escape(text)}</td>")
+        html_rows.append("<tr>" + "".join(cells) + "</tr>")
+    return "<table>" + "".join(html_rows) + "</table>"
+
+
+def _table_html_cell_count(html_code: str) -> int:
+    return len(re.findall(r"<(?:td|th)\b", html_code or "", flags=re.I))
+
+
+def _table_html_grid_shape(html_code: str):
+    """(row count, widest row's column span) of an HTML table fragment."""
+    rows = re.findall(r"<tr\b[^>]*>(.*?)</tr>", html_code or "", flags=re.S | re.I)
+    width = 0
+    for row in rows:
+        columns = 0
+        for attrs in re.findall(r"<t[dh]\b([^>]*)>", row, flags=re.I):
+            span = re.search(r'colspan\s*=\s*"?\s*(\d+)', attrs, flags=re.I)
+            columns += int(span.group(1)) if span else 1
+        width = max(width, columns)
+    return len(rows), width
+
+
+def _native_text_grid_repair(table_res_dict: Dict, model_html: str) -> str | None:
+    """Replace a collapsed or lossy model table with the native text grid.
+
+    Only used when the native route already had this page's text primitives
+    and the model output either collapsed the region into a single cell or
+    dropped characters.  A model table that preserves the region's text is
+    left untouched, so ordinary tables keep their current output.
+    """
+    page_dict = table_res_dict.get('_page_dict')
+    table_bbox = table_res_dict.get('_table_bbox')
+    if page_dict is None or table_bbox is None:
+        return None
+    if '_docvortex_table_page' not in page_dict:
+        return None
+    grid_html = _native_text_grid_html(page_dict, table_bbox)
+    if not grid_html:
+        return None
+    grid_coverage = _native_table_text_coverage(page_dict, table_bbox, grid_html)
+    if grid_coverage is None or grid_coverage < 0.99:
+        return None
+    if _native_table_lost_signed_number(page_dict, table_bbox, grid_html):
+        return None
+    model_coverage = _native_table_text_coverage(page_dict, table_bbox, model_html)
+    model_cells = _table_html_cell_count(model_html)
+    model_blank = _table_html_blank_ratio(model_html)
+    grid_rows, grid_cols = _table_html_grid_shape(grid_html)
+    # A collapsed region is always worth rebuilding.  A lossy, mostly-empty
+    # model output is only rebuilt when the native text also forms a real grid
+    # (several rows and columns) - a small or multi-column fragment can be
+    # reassembled incorrectly, and those pages are already served well.
+    collapsed = model_cells <= 1 and grid_rows * grid_cols >= 2
+    dense_rebuild = (
+        model_coverage is not None and model_coverage < 0.95
+        and model_blank > 0.6 and grid_rows >= 5 and grid_cols >= 5)
+    if collapsed or dense_rebuild:
+        logger.info(
+            f'native text grid replaces model table bbox={tuple(round(float(v), 1) for v in table_bbox)} '
+            f'({model_cells} cells, coverage '
+            f'{model_coverage if model_coverage is None else round(model_coverage, 3)}, '
+            f'blank {round(model_blank, 3)}, grid {grid_rows}x{grid_cols})')
+        return grid_html
+    return None
+
+
+def _native_vertical_text_repair(table_res_dict: Dict, model_html: str) -> str | None:
+    """Replace a lossy model table with its native vertical text column.
+
+    Continuation pages of a cross-page table carry one wrapped paragraph in a
+    narrow grid column.  The structure model keeps only a few clipped glyphs
+    (coverage below 5 % on the reported pages), so emitting the exact PDF text
+    preserves the paragraph.  A model table that kept the region's text is
+    left untouched.
+    """
+    page_dict = table_res_dict.get('_page_dict')
+    table_bbox = table_res_dict.get('_table_bbox')
+    if page_dict is None or table_bbox is None:
+        return None
+    text = _native_vertical_text_column(page_dict, table_bbox)
+    if not text:
+        return None
+    model_coverage = _native_table_text_coverage(page_dict, table_bbox, model_html)
+    if model_coverage is not None and model_coverage >= 0.5:
+        return None
+    logger.info(
+        f'native vertical text replaces model table '
+        f'bbox={tuple(round(float(v), 1) for v in table_bbox)} '
+        f'(coverage {model_coverage if model_coverage is None else round(model_coverage, 3)})')
+    return f"<table><tbody><tr><td>{escape(text)}</td></tr></tbody></table>"
 
 
 def _count_uncovered_text_boxes(det_res, ocr_result, min_overlap: float = 0.3):
@@ -707,6 +1087,11 @@ def _prepare_table_data(
     pdf_not_rotate = page_dict.get("rotate_label") not in ["90", "180", "270"]
     poly = table_res_dict['table_res']['poly']
     table_bbox = (poly[0] / scale, poly[1] / scale, poly[4] / scale, poly[5] / scale)
+    # Kept for the post-model native text-grid repair: a borderless table can
+    # be rejected by DocVortex and still be fully recoverable from the PDF
+    # text, but the model is only asked after the native attempt.
+    table_res_dict['_page_dict'] = page_dict
+    table_res_dict['_table_bbox'] = table_bbox
     table_bbox_scaled = (poly[0], poly[1], poly[4], poly[5])
     has_embedded_formula = any(
         item.get('bbox') and _box_center_in(table_bbox_scaled, item['bbox'])
@@ -722,7 +1107,8 @@ def _prepare_table_data(
         if vertical_text:
             logger.info(
                 f'DocVortex vertical text fragment kept as native text '
-                f'({len(vertical_text)} chars)')
+                f'({len(vertical_text)} chars, bbox='
+                f'{tuple(round(float(v), 1) for v in table_bbox)})')
             table_res = table_res_dict['table_res']
             table_res['html'] = (
                 f"<table><tbody><tr><td>{escape(vertical_text)}</td></tr></tbody></table>")
@@ -1143,7 +1529,18 @@ def _write_table_result(table_res_dict, html_code):
     if html_code and '<table>' in html_code and '</table>' in html_code:
         start = html_code.find('<table>')
         end = html_code.rfind('</table>') + len('</table>')
-        table_res_dict['table_res']['html'] = html_code[start:end]
+        html = html_code[start:end]
+        repaired = _native_vertical_text_repair(table_res_dict, html)
+        method = 'native_vertical_text'
+        if repaired is None:
+            repaired = _native_text_grid_repair(table_res_dict, html)
+            method = 'native_text_grid'
+        if repaired is not None:
+            html = repaired
+            existing = table_res_dict['table_res'].get('table_parse_method')
+            table_res_dict['table_res']['table_parse_method'] = existing or method
+            table_res_dict['table_res']['rule_table_score'] = 1.0
+        table_res_dict['table_res']['html'] = html
         return True
     logger.warning('table recognition processing fails')
     return False

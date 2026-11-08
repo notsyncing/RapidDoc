@@ -10,8 +10,11 @@ empty.
 from rapid_doc.backend.pipeline.analyze_utils import (
     _native_table_lost_signed_number,
     _native_table_text_coverage,
+    _native_text_grid_html,
+    _native_vertical_text_column,
     _native_vertical_text_fragment,
     _table_html_blank_ratio,
+    _table_html_grid_shape,
 )
 
 BBOX = (0.0, 0.0, 500.0, 700.0)
@@ -86,3 +89,77 @@ def test_native_table_that_keeps_the_minus_sign_is_accepted():
     html = _sparse_html("（二）所有者投入和减少资本-61,301,849.85")
 
     assert _native_table_lost_signed_number(page, BBOX, html) is False
+
+
+def test_coverage_normalises_typographic_quotes():
+    # The native HTML writes ASCII quotes while the PDF text carries the
+    # typographic form; that is not lost content.
+    page = _page((240.0, 80.0, 290.0, 680.0, "“追加补偿探矿权”"))
+    html = _sparse_html('"追加补偿探矿权"')
+
+    assert _native_table_text_coverage(page, BBOX, html) == 1.0
+
+
+def test_vertical_text_column_accepts_multi_glyph_runs():
+    # Wrapped continuation text arrives as multi-character horizontal runs in
+    # a narrow column, not one glyph per line.
+    text = ("有关上市规则及公司章程的规定遵循等价有偿公平交易的原则履行合法程序"
+            "保证信息披露真实准确完整不得有虚假记载误导性陈述或重大遗漏"
+            "公司董事会应当勤勉尽责维护公司及全体股东的合法权益")
+    rows = [text[index:index + 4] for index in range(0, len(text), 4)]
+    page = _page(*[(240.0, 80.0 + index * 17.0, 280.0, 90.0 + index * 17.0, run)
+                   for index, run in enumerate(rows)])
+
+    assert _native_vertical_text_column(page, BBOX) == text
+
+
+def test_wide_horizontal_paragraph_is_not_a_vertical_column():
+    text = "有关上市规则及公司章程的规定遵循等价有偿公平交易的原则履行合法程序"
+    rows = [text[index:index + 4] for index in range(0, len(text), 4)]
+    page = _page(*[(20.0, 80.0 + index * 14.5, 480.0, 90.0 + index * 14.5, run)
+                   for index, run in enumerate(rows)])
+
+    assert _native_vertical_text_column(page, BBOX) is None
+
+
+def _grid_page(rows):
+    chars = []
+    for y, cells in rows:
+        for x, text in cells:
+            for offset, char in enumerate(text):
+                left = x + offset * 10.0
+                chars.append({"char": char, "bbox": (left, y, left + 9.0, y + 9.0)})
+    return {"chars": chars}
+
+
+def test_native_text_grid_rebuilds_rows_and_columns():
+    page = _grid_page([
+        (5.0, [(5.0, "第一组")]),
+        (40.0, [(5.0, "甲乙"), (105.0, "丙丁"), (205.0, "12")]),
+        (70.0, [(5.0, "戊己"), (105.0, "庚辛"), (205.0, "34")]),
+    ])
+    rules = [(0.0, 0.0, 300.0, 0.0), (0.0, 30.0, 300.0, 30.0),
+             (0.0, 60.0, 300.0, 60.0), (0.0, 100.0, 300.0, 100.0)]
+
+    html = _native_text_grid_html(page, (0.0, 0.0, 300.0, 100.0), rules=rules)
+
+    assert html is not None
+    assert 'colspan="3"' in html
+    assert "第一组" in html
+    assert "甲乙" in html and "丙丁" in html and "12" in html
+    assert "戊己" in html and "庚辛" in html and "34" in html
+
+
+def test_native_text_grid_needs_more_than_one_column():
+    page = _grid_page([(5.0, [(5.0, "只有一列")]), (40.0, [(5.0, "还是这一列")])])
+    rules = [(0.0, 0.0, 300.0, 0.0), (0.0, 30.0, 300.0, 30.0),
+             (0.0, 100.0, 300.0, 100.0)]
+
+    assert _native_text_grid_html(page, (0.0, 0.0, 300.0, 100.0), rules=rules) is None
+
+
+def test_table_html_grid_shape_counts_colspan():
+    html = ('<table><tr><td colspan="3">标题</td></tr>'
+            '<tr><td>a</td><td>b</td><td>c</td></tr></table>')
+
+    assert _table_html_grid_shape(html) == (2, 3)
